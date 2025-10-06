@@ -1,0 +1,89 @@
+{
+  "data_config": {
+    "excel_path": "data/collision_3D.xlsx",
+    "schema": {
+      "header": null,
+      "input_cols": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "output_slices": [
+        [
+          12,
+          21
+        ],
+        [
+          21,
+          30
+        ],
+        [
+          30,
+          39
+        ]
+      ],
+      "infer_T_from_outputs": true,
+      "K": 3
+    },
+    "normalization": {
+      "inputs": {
+        "mode": "standardize",
+        "include_indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ]
+      },
+      "outputs": {
+        "mode": "standardize"
+      }
+    },
+    "task_name": "collision_3D"
+  },
+  "model_config": {
+    "kind": "ffn",
+    "ffn": {
+      "hidden_dim": 256,
+      "n_hidden": 4,
+      "activation": "gelu",
+      "dropout": 0.1
+    }
+  },
+  "run_config": {
+    "seed": 42,
+    "device": "auto",
+    "epochs": 200,
+    "batch_size": 64,
+    "lr": 0.0003,
+    "val_split": 0.1,
+    "test_ratio": 0.1,
+    "num_workers": 0,
+    "early_stopping": {
+      "enabled": true,
+      "patience": 30
+    },
+    "logging": {
+      "run_name": "",
+      "out_dir": "runs",
+      "save_every": 0
+    }
+  }
+}

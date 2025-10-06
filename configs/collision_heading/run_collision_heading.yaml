@@ -1,0 +1,26 @@
+# File: run_collision_heading.yaml
+# Author: Mia Scoblic
+# Date: 2025-08-15
+# Description:
+#     This file defines the training hyperparameters
+
+  seed: 42                   # set random seed for reproducibility
+  device: auto              # auto/cpu/cuda
+  epochs: 100               # max number of times the entire training dataset is seen
+  batch_size: 64            # number of samples processed together in each pass
+  lr: 1e-3               # learning rate, small = low/stable, large = fast/risk of divergence
+  val_split: 0.1            # validation split
+  test_ratio: 0.1           # test split
+  num_workers: 0            # option for parallel workers
+  out_csv: collisions_pred_test.csv
+
+
+  # option to stop early if validation loss stops improving withing a set number of epochs
+  early_stopping:
+    enabled: true
+    patience: 10
+
+  logging:
+    run_name: ""            # auto-generated run folder unless specified
+    out_dir: runs           # stored in trajectory_nn/runs
+    save_every: 0           # how often to save checkpoints, 0 = only best, N = every N epochs too

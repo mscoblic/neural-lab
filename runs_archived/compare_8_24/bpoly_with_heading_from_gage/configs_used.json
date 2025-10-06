@@ -1,0 +1,75 @@
+{
+  "data_config": {
+    "excel_path": "data/collision_heading_bpoly_gage.xlsx",
+    "schema": {
+      "header": null,
+      "input_cols": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "output_slices": [
+        [
+          7,
+          17
+        ],
+        [
+          17,
+          27
+        ]
+      ],
+      "infer_T_from_outputs": true,
+      "K": 2
+    },
+    "normalization": {
+      "inputs": {
+        "mode": "standardize",
+        "include_indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ]
+      },
+      "outputs": {
+        "mode": "standardize"
+      }
+    },
+    "task_name": "collision_heading_bpoly_gage"
+  },
+  "model_config": {
+    "kind": "ffn",
+    "ffn": {
+      "hidden_dim": 128,
+      "n_hidden": 3,
+      "activation": "relu",
+      "dropout": 0.0
+    }
+  },
+  "run_config": {
+    "seed": 42,
+    "device": "auto",
+    "epochs": 150,
+    "batch_size": 64,
+    "lr": 0.001,
+    "val_split": 0.1,
+    "test_ratio": 0.1,
+    "num_workers": 0,
+    "early_stopping": {
+      "enabled": true,
+      "patience": 10
+    },
+    "logging": {
+      "run_name": "",
+      "out_dir": "runs",
+      "save_every": 0
+    }
+  }
+}

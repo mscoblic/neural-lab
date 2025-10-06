@@ -1,0 +1,24 @@
+# File: run_collision_heading.yaml
+# Author: Mia Scoblic
+# Date: 2025-08-15
+# Description:
+#     This file defines the training hyperparameters
+
+seed: 42
+device: auto
+epochs: 200             # more runway
+batch_size: 64
+lr: 0.0003              # lower LR for smoother convergence
+val_split: 0.1
+test_ratio: 0.1
+num_workers: 0
+
+early_stopping:
+  enabled: true
+  patience: 30          # give model time to improve with lower LR
+
+logging:
+  run_name: ""          # auto-generated run folder unless specified
+  out_dir: runs
+  save_every: 0
+

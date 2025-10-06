@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "task_name": "airspace",
+    "T": 9,
+    "input_dim": 8,
+    "output_dim": 18,
+    "excel_path": "/Users/mia/PycharmProjects/trajectory_nn/data/airspaceOneHot.xlsx"
+  },
+  "params": 152082
+}

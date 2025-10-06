@@ -1,0 +1,5 @@
+{
+  "data_config": "/Users/mia/PycharmProjects/trajectory_nn/configs/airspace/data_airspace.yaml",
+  "model_config": "/Users/mia/PycharmProjects/trajectory_nn/configs/airspace/model_airspace.yaml",
+  "run_config": "/Users/mia/PycharmProjects/trajectory_nn/configs/airspace/run_airspace.yaml"
+}

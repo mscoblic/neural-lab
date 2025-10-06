@@ -1,0 +1,34 @@
+# File: data_collision_heading_bpoly.yaml
+# Author: Mia Scoblic
+# Date: 2025-08-15
+# Description:
+#     This file points to an Excel file in the 'data' folder and defines the Excel data layout and normalization techniques
+
+excel_path: data/collision_heading_bpoly_noheading.xlsx
+
+schema:
+  # define excel header
+  header: null
+
+  # inputs: x0, y0, xf, yf, ox, oy
+  input_cols: [0, 1, 2, 3, 4, 5]
+
+  # outputs: x trajectory, y trajectory
+  # MUST BE IN ORDER X, Y
+  output_slices:
+    - [6, 16]
+    - [16, 26]
+  # infer the number of traj points based on output, flexible if the data range changes
+  infer_T_from_outputs: true
+  K: 2
+
+# choose the mode of normalization (standardize/
+# include_indices allows you to choose a subset of inputs to include in standardization
+normalization:
+  inputs:
+    mode: standardize
+    include_indices: [0, 1, 2, 3, 4, 5]
+  outputs:
+    mode: standardize
+
+task_name: collision_heading_bpoly_noheading

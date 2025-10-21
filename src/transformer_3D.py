@@ -1,17 +1,18 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
 import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 import os
-from mpl_toolkits.mplot3d import Axes3D
+import time
 
 # Enable/disable training
 TRAIN = True
 DEBUG = False
+TIME_EVAL = False
 
 # Plotting
 def _to_np(t):
@@ -294,23 +295,6 @@ class TrajDataset(Dataset):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-'''
-T_in = 4
-file_path = "../data/collision_3D.xlsx"
-df = pd.read_excel(file_path)
-
-# Build 4 semantic tokens, each 2-D: start, end, obstacle, control
-start    = df[["x0","y0", "z0"]].to_numpy(np.float32)  # (N, 2)
-end      = df[["xf","yf", "zf"]].to_numpy(np.float32)  # (N, 2)
-obstacle = df[["ox","oy", "oz"]].to_numpy(np.float32)  # (N, 2)
-control  = df[["x3","y3", "z3"]].to_numpy(np.float32)  # (N, 2)
-
-output_cols = ["x4", "x5", "x6", "x7", "x8", "y4", "y5", "y6", "y7", "y8", "z4", "z5", "z6", "z7", "z8"]
-T_out = len(output_cols) // 3
-if DEBUG == True:
-    print("Derived T_out =", T_out)  # expect 6
-'''
-
 T_in = 4
 file_path = "../data/collision_3D_freevelocity.xlsx"
 df = pd.read_excel(file_path)
@@ -366,7 +350,7 @@ d_model   = 64
 num_heads = 4
 num_layers= 2
 d_ff      = 128
-dropout   = 0.0
+dropout   = 0.2
 output_dim= 3        # (x,y) per step
 max_seq_length = T_in
 if DEBUG == True:
@@ -417,7 +401,7 @@ if DEBUG == True:
 model = TrajModel(encoder, head).to(device)
 
 criterion = nn.MSELoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
 
 test_mse_hist = []
 coll_rate_hist = []
@@ -502,10 +486,16 @@ def count_collisions(model, loader, radius=0.1):
 
     return collided / max(total, 1)
 
-
+# Scheduled LR
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode = 'min', # minimize metric
+    factor = 0.5, # reduce LR by half
+    patience = 3, # wait 3 epochs before reducing
+)
 
 # Train a few epochs
-EPOCHS = 1
+EPOCHS = 20
 train_losses = []
 if TRAIN:
     for epoch in range(EPOCHS):
@@ -521,8 +511,10 @@ if TRAIN:
         coll = count_collisions(model, test_dl, radius=0.1)
         coll_rate_hist.append(coll)
 
-        print(f"epoch {epoch+1:02d} | train MSE {tr:.6f} | "
-              f"test MSE {te:.6f} | collisions {coll*100:.2f}%")
+        scheduler.step(te)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"epoch {epoch+1:02d} | train MSE {tr:.6f} | test MSE {te:.6f} | collisions {coll:.2%} | LR {current_lr:.6f}")
 
     # ---- PLOTS ----
     os.makedirs("figs", exist_ok=True)
@@ -551,6 +543,47 @@ else:
     model.load_state_dict(torch.load("transformer_traj.pth", map_location=device))
     model.eval()
 
+if TIME_EVAL:
+    print("\n" + "=" * 60)
+    print("TIMING INFERENCE")
+    print("=" * 60)
+
+    # Single sample timing (useful for real-time applications)
+    print("\n--- Single Sample Timing ---")
+    single_X = test_ds[0][0].unsqueeze(0).to(device)
+
+    # Warmup
+    print("Running warmup iterations...")
+    with torch.no_grad():
+        for _ in range(20):
+            _ = model(single_X)
+
+    # Time many single inferences
+    print("Running timed iterations...")
+    single_times = []
+    with torch.no_grad():
+        for _ in range(100):
+            start = time.perf_counter()
+            _ = model(single_X)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            end = time.perf_counter()
+            single_times.append((end - start) * 1000)  # Convert to ms
+
+    single_times = np.array(single_times)
+    print(f"\nSingle sample inference time: {single_times.mean():.3f}ms ± {single_times.std():.3f}ms")
+    print(f"Min: {single_times.min():.3f}ms, Max: {single_times.max():.3f}ms")
+    print(f"Median: {np.median(single_times):.3f}ms")
+    print(f"Frequency: {1000 / single_times.mean():.0f} Hz")
+
+    print("\n" + "=" * 60)
+
+# Standard evaluation
+print("\nComputing test metrics...")
+test_mse = eval_epoch(test_dl)
+test_coll = count_collisions(model, test_dl, radius=0.1)
+print(f"Test MSE: {test_mse:.6f}")
+print(f"Test collision rate: {test_coll * 100:.2f}%")
 
 # plot first 3 validation samples
 plot_many_samples(model, test_ds, indices=[0,1,2], title_prefix="test")

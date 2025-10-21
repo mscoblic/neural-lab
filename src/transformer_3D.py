@@ -7,7 +7,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
-import time
+import sys
+from pathlib import Path
+project_root = Path(__file__).resolve().parent.parent  # Go up from src/ to neural-lab/
+sys.path.append(str(project_root / 'tools' / 'extra'))
+from BeBOT import PiecewiseBernsteinPoly
 
 # Enable/disable training
 TRAIN = True
@@ -305,7 +309,7 @@ end      = df[["xf","yf", "zf"]].to_numpy(np.float32)  # (N, 2)
 obstacle = df[["ox","oy", "oz"]].to_numpy(np.float32)  # (N, 2)
 control  = df[["x2","y2", "z2"]].to_numpy(np.float32)  # (N, 2)
 
-output_cols = ["x3", "x4", "x5", "x6", "x7", "x8", "x9", "y3", "y4", "y5", "y6", "y7", "y8", "y9", "z3", "z4", "z5", "z6", "z7", "z8", "z9"]
+output_cols = ["x3", "x4", "x5", "x6", "x7", "x8", "y3", "y4", "y5", "y6", "y7", "y8", "z3", "z4", "z5", "z6", "z7", "z8"]
 T_out = len(output_cols) // 3
 if DEBUG == True:
     print("Derived T_out =", T_out)  # expect 6
@@ -320,10 +324,10 @@ Y_np = Y_np.reshape(N, 3, T_out).transpose(0, 2, 1)  # (N, 7, 2)
 
 # === Normalize inputs and outputs ===
 # Compute mean/std over the full dataset (all samples, all tokens, both x and y)
-X_mean = X_np.mean(axis=(0, 1), keepdims=True)        # shape (1, T_in, 2)
-X_std  = X_np.std(axis=(0, 1), keepdims=True) + 1e-8
-Y_mean = Y_np.mean(axis=(0, 1), keepdims=True)        # shape (1, T_out, 2)
-Y_std  = Y_np.std(axis=(0, 1), keepdims=True) + 1e-8
+X_mean = X_np.mean(axis=0, keepdims=True)        # shape (1, T_in, 2)
+X_std  = X_np.std(axis=0, keepdims=True) + 1e-8
+Y_mean = Y_np.mean(axis=0, keepdims=True)        # shape (1, T_out, 2)
+Y_std  = Y_np.std(axis=0, keepdims=True) + 1e-8
 
 # Apply normalization
 X_np = (X_np - X_mean) / X_std
@@ -479,7 +483,7 @@ def count_collisions(model, loader, radius=0.1):
 
         # distances to obstacle center
         dist = torch.linalg.norm(Yp_den - obs_den[:, None, :], dim=-1)  # (B, T_out)
-        inside = (dist < radius -  0.005)               # (B, T_out)
+        inside = (dist < radius -  0.005)   # was 0.005
 
         collided += inside.any(dim=1).sum().item()
         total += X.size(0)
@@ -495,7 +499,7 @@ scheduler = optim.lr_scheduler.ReduceLROnPlateau(
 )
 
 # Train a few epochs
-EPOCHS = 20
+EPOCHS = 1
 train_losses = []
 if TRAIN:
     for epoch in range(EPOCHS):

@@ -9,25 +9,26 @@ import matplotlib.pyplot as plt
 import os
 import sys
 from pathlib import Path
-project_root = Path(__file__).resolve().parent.parent  # Go up from src/ to neural-lab/
+import time
+project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root / 'tools' / 'extra'))
 from BeBOT import PiecewiseBernsteinPoly
+from BeBOT import BernsteinPoly
+import matplotlib.animation as animation
 
 # Enable/disable training
 TRAIN = True
 DEBUG = False
 TIME_EVAL = False
+VISCOL = False # True to plot collisions
 
 # Plotting
 def _to_np(t):
     return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
 
-# Plot and save a specific index
-from mpl_toolkits.mplot3d import Axes3D  # keep this import (safe for all versions)
-
 @torch.no_grad()
 def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
-                        elev=45, azim=-70):
+                        elev=45, azim=-70, n_eval=50, plot_continuous=True):
     model.eval()
     device = next(model.parameters()).device
 
@@ -52,6 +53,32 @@ def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
     ox, oy, oz = X_denorm[2].tolist()    # obstacle
     cpx, cpy, cpz = X_denorm[3].tolist() # control
 
+    # --- Build polynomial ---
+    if plot_continuous:
+        pred_points = Y_pred_denorm.numpy()
+
+        cp3 = pred_points[0]
+        cp4 = pred_points[1]
+        cp5 = pred_points[2]        # duplicate cp
+        cp6 = pred_points[3]
+        cp7 = pred_points[4]
+        cp8 = pred_points[5]
+
+        control_points_x = np.array([x0, cpx, cp3[0], cp4[0], cp5[0],
+                                     cp5[0], cp6[0], cp7[0], cp8[0], xf])
+        control_points_y = np.array([y0, cpy, cp3[1], cp4[1], cp5[1],
+                                     cp5[1], cp6[1], cp7[1], cp8[1], yf])
+        control_points_z = np.array([z0, cpz, cp3[2], cp4[2], cp5[2],
+                                     cp5[2], cp6[2], cp7[2], cp8[2], zf])
+
+        tknots = np.array([0, 0.5, 1.0])
+        t_eval = np.linspace(0, 1, n_eval)
+
+        traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
+        traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
+        traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
+
+
     # --- 3D scatter plot ---
     fig = plt.figure(figsize=(7, 7))
     ax = fig.add_subplot(111, projection='3d')
@@ -60,6 +87,10 @@ def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.set_zlim(0, 1)
+
+    if plot_continuous:
+        ax.plot(traj_x, traj_y, traj_z, 'b-', linewidth=2,
+                label='Continuous Trajectory', alpha=0.7, zorder=1)
 
     # start / end / control / obstacle
     ax.scatter([x0], [y0], [z0], s=80, marker = 'o', label='start', depthshade=False)
@@ -103,6 +134,192 @@ def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
     else:
         plt.show()
 
+@torch.no_grad()
+def plot_collision_sample(model, ds, idx, save_path=None, title_prefix="collision",
+                          elev=45, azim=-70, n_eval=50, obstacle_radius=0.1):
+    """
+    Visualize a trajectory sample highlighting collision points with the obstacle.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    # fetch one sample (normalized tensors)
+    X, Y_true = ds[idx]
+    Y_pred = model(X.unsqueeze(0).to(device))[0].cpu()
+
+    # prepare stats
+    X_mean_t = torch.from_numpy(X_mean.squeeze(0)).to(X.dtype)
+    X_std_t = torch.from_numpy(X_std.squeeze(0)).to(X.dtype)
+    Y_mean_t = torch.from_numpy(Y_mean.squeeze(0)).to(Y_pred.dtype)
+    Y_std_t = torch.from_numpy(Y_std.squeeze(0)).to(Y_pred.dtype)
+
+    # denormalize
+    X_denorm = X * X_std_t + X_mean_t
+    Y_true_denorm = Y_true * Y_std_t + Y_mean_t
+    Y_pred_denorm = Y_pred * Y_std_t + Y_mean_t
+
+    # recover tokens
+    x0, y0, z0 = X_denorm[0].tolist()
+    xf, yf, zf = X_denorm[1].tolist()
+    ox, oy, oz = X_denorm[2].tolist()
+    cpx, cpy, cpz = X_denorm[3].tolist()
+
+    # Build polynomial trajectory
+    pred_points = Y_pred_denorm.numpy()
+    cp3 = pred_points[0]
+    cp4 = pred_points[1]
+    cp5 = pred_points[2]
+    cp6 = pred_points[3]
+    cp7 = pred_points[4]
+    cp8 = pred_points[5]
+
+    control_points_x = np.array([x0, cpx, cp3[0], cp4[0], cp5[0],
+                                 cp5[0], cp6[0], cp7[0], cp8[0], xf])
+    control_points_y = np.array([y0, cpy, cp3[1], cp4[1], cp5[1],
+                                 cp5[1], cp6[1], cp7[1], cp8[1], yf])
+    control_points_z = np.array([z0, cpz, cp3[2], cp4[2], cp5[2],
+                                 cp5[2], cp6[2], cp7[2], cp8[2], zf])
+
+    tknots = np.array([0, 0.5, 1.0])
+    t_eval = np.linspace(0, 1, n_eval)
+
+    traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
+    traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
+    traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
+
+    # Check for collisions along trajectory
+    obstacle_center = np.array([ox, oy, oz])
+    distances = np.sqrt((traj_x - ox) ** 2 + (traj_y - oy) ** 2 + (traj_z - oz) ** 2)
+    collision_mask = distances < obstacle_radius
+    num_collisions = np.sum(collision_mask)
+    min_distance = np.min(distances)
+
+    # Find closest point to obstacle
+    closest_idx = np.argmin(distances)
+
+    # Split trajectory into safe and collision segments
+    safe_mask = ~collision_mask
+
+    # 3D plot
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_box_aspect([1, 1, 1])
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_zlim(0, 1)
+
+    # Plot trajectory - safe parts in blue, collision parts in red
+    if np.any(safe_mask):
+        ax.plot(traj_x[safe_mask], traj_y[safe_mask], traj_z[safe_mask],
+                'b-', linewidth=2, label='Safe trajectory', alpha=0.7)
+
+    if np.any(collision_mask):
+        ax.plot(traj_x[collision_mask], traj_y[collision_mask], traj_z[collision_mask],
+                'r-', linewidth=3, label='COLLISION ZONE', alpha=0.9, zorder=10)
+
+    # Highlight closest point to obstacle
+    ax.scatter([traj_x[closest_idx]], [traj_y[closest_idx]], [traj_z[closest_idx]],
+               s=150, color='orange', marker='X', label=f'Closest point (d={min_distance:.4f})',
+               edgecolors='black', linewidths=2, depthshade=False, zorder=11)
+
+    # Start / end / control / obstacle
+    ax.scatter([x0], [y0], [z0], s=80, marker='o', label='start', depthshade=False)
+    ax.scatter([xf], [yf], [zf], s=120, marker='*', label='end', depthshade=False)
+    ax.scatter([ox], [oy], [oz], s=120, color='red', label='obstacle center',
+               depthshade=False, zorder=5)
+
+    # Ground truth points
+    Yt = Y_true_denorm.numpy()
+    ax.scatter(Yt[:, 0], Yt[:, 1], Yt[:, 2], s=36, color='black',
+               marker='x', label='ground truth', depthshade=False)
+
+    # Predicted control points with distance labels
+    Yp = Y_pred_denorm.numpy()
+    cp_distances = [np.linalg.norm(cp - obstacle_center) for cp in Yp]
+
+    for i, (cp, dist) in enumerate(zip(Yp, cp_distances)):
+        color = 'green' if dist > obstacle_radius else 'red'
+        ax.scatter([cp[0]], [cp[1]], [cp[2]], s=50, marker='o',
+                   color=color, alpha=0.6, depthshade=False)
+        ax.text(float(cp[0]), float(cp[1]), float(cp[2]),
+                f'{i + 1}\nd={dist:.3f}',
+                fontsize=7, ha='left', va='bottom', color=color,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
+
+    ax.scatter([cpx], [cpy], [cpz], s=80, marker='o',
+               label='heading control point', depthshade=False)
+
+    # Draw obstacle sphere - make it semi-transparent
+    R = obstacle_radius
+    u, v = np.mgrid[0:2 * np.pi:20j, 0:np.pi:10j]
+    xs = ox + R * np.cos(u) * np.sin(v)
+    ys = oy + R * np.sin(u) * np.sin(v)
+    zs = oz + R * np.cos(v)
+    ax.plot_surface(xs, ys, zs, color='red', alpha=0.3, linewidth=0)
+
+    # Also draw wireframe for clarity
+    ax.plot_wireframe(xs, ys, zs, color='red', alpha=0.5, linewidth=0.5)
+
+    # Draw convex hulls for each segment (optional visualization)
+    # Segment 1: [x0, cpx, cp3, cp4, cp5]
+    seg1_points = np.array([[x0, y0, z0], [cpx, cpy, cpz],
+                            cp3, cp4, cp5])
+    # Segment 2: [cp5, cp6, cp7, cp8, xf]
+    seg2_points = np.array([cp5, cp6, cp7, cp8, [xf, yf, zf]])
+
+    from scipy.spatial import ConvexHull
+    try:
+        hull1 = ConvexHull(seg1_points)
+        hull2 = ConvexHull(seg2_points)
+
+        # Plot convex hull edges
+        for simplex in hull1.simplices:
+            ax.plot(seg1_points[simplex, 0], seg1_points[simplex, 1],
+                    seg1_points[simplex, 2], 'c--', alpha=0.3, linewidth=0.5)
+        for simplex in hull2.simplices:
+            ax.plot(seg2_points[simplex, 0], seg2_points[simplex, 1],
+                    seg2_points[simplex, 2], 'm--', alpha=0.3, linewidth=0.5)
+    except:
+        pass  # Skip if convex hull fails (coplanar points, etc.)
+
+    # Cosmetics
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+
+    collision_status = "COLLISION" if num_collisions > 0 else "SAFE"
+    ax.set_title(f"{title_prefix} idx={idx} | {collision_status}\n"
+                 f"Collision points: {num_collisions}/{n_eval} | "
+                 f"Min distance: {min_distance:.4f} | Radius: {obstacle_radius}")
+
+    ax.legend(loc='upper left', fontsize=8)
+    ax.grid(True)
+
+    if save_path:
+        fig.savefig(save_path, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+    # Print diagnostic info
+    print(f"\n{'=' * 60}")
+    print(f"Sample {idx} Analysis:")
+    print(f"{'=' * 60}")
+    print(f"Collision Status: {collision_status}")
+    print(f"Collision points: {num_collisions}/{n_eval} ({100 * num_collisions / n_eval:.2f}%)")
+    print(f"Minimum distance to obstacle: {min_distance:.6f}")
+    print(f"Obstacle radius: {obstacle_radius}")
+    print(f"Safety margin: {min_distance - obstacle_radius:.6f}")
+    print(f"\nControl Point Distances to Obstacle:")
+    all_cps = [('start', x0, y0, z0), ('heading', cpx, cpy, cpz)] + \
+              [(f'cp{i + 3}', *cp) for i, cp in enumerate(Yp)] + \
+              [('end', xf, yf, zf)]
+    for name, x, y, z in all_cps:
+        dist = np.linalg.norm(np.array([x, y, z]) - obstacle_center)
+        status = "✓ SAFE" if dist > obstacle_radius else "✗ PENETRATES"
+        print(f"  {name:8s}: {dist:.6f}  {status}")
+    print(f"{'=' * 60}\n")
 
 # Visualize many samples quickly
 @torch.no_grad()
@@ -110,8 +327,6 @@ def plot_many_samples(model, ds, indices, title_prefix="test"):
     """Convenience: plot several dataset samples by index."""
     for j, idx in enumerate(indices):
         plot_dataset_sample(model, ds, idx, title_prefix=title_prefix)
-
-
 
 # Splits input into multiple attention heads, applies attention, combines results
 class MultiHeadAttention(nn.Module):
@@ -289,6 +504,7 @@ class TrajModel(nn.Module):
         h = self.encoder(x)   # (B, T_in, d_model)
         return self.head(h)   # (B, 7, 2)
 
+
 class TrajDataset(Dataset):
     def __init__(self, X, Y):
         self.X = torch.as_tensor(X, dtype=torch.float32)
@@ -314,7 +530,7 @@ T_out = len(output_cols) // 3
 if DEBUG == True:
     print("Derived T_out =", T_out)  # expect 6
 
-# Stack into tokens → (N, 4, 2)
+# Stack into tokens → (N, 4, 3)
 X_np = np.stack([start, end, obstacle, control], axis=1)
 Y_np = df[output_cols].to_numpy(dtype=np.float32)    # (N, 20)
 
@@ -357,17 +573,18 @@ d_ff      = 128
 dropout   = 0.2
 output_dim= 3        # (x,y) per step
 max_seq_length = T_in
-if DEBUG == True:
-    print("max_seq_length =", max_seq_length)
 batch_size = 32
 lr = 1e-3
+
+if DEBUG == True:
+    print("max_seq_length =", max_seq_length)
 
 # Create data
 seed = 42
 rng = np.random.default_rng(seed)
 perm = rng.permutation(N)
 
-n_train = int(0.80 * N)
+n_train = int(0.001 * N)
 idx_train = perm[:n_train]
 idx_test  = perm[n_train:]
 
@@ -383,7 +600,6 @@ def excel_row_from_test_idx(ds_idx):
     # Optional: show the actual row values for sanity
     print(df.iloc[orig_idx])
     return orig_idx, excel_row
-
 
 train_ds = TrajDataset(X_np[idx_train], Y_np[idx_train])
 test_ds  = TrajDataset(X_np[idx_test],  Y_np[idx_test])
@@ -409,7 +625,6 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
 
 test_mse_hist = []
 coll_rate_hist = []
-
 
 def train_one_epoch():
     model.train()
@@ -483,12 +698,169 @@ def count_collisions(model, loader, radius=0.1):
 
         # distances to obstacle center
         dist = torch.linalg.norm(Yp_den - obs_den[:, None, :], dim=-1)  # (B, T_out)
-        inside = (dist < radius -  0.005)   # was 0.005
+        inside = (dist < radius -  0)   # was 0.005
 
         collided += inside.any(dim=1).sum().item()
         total += X.size(0)
 
     return collided / max(total, 1)
+
+@torch.no_grad()
+def count_collisions_continuous(model, loader, radius=0.1, buffer=0.0, n_eval=50):
+    """
+    Count collisions on the continuous Bernstein polynomial trajectory.
+
+    radius: obstacle radius
+    buffer: safety margin (positive = more conservative)
+    n_eval: number of points to evaluate along curve (higher = more accurate)
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    # Load normalization stats
+    X_mean_t = torch.from_numpy(X_mean).to(device)
+    X_std_t = torch.from_numpy(X_std).to(device)
+    Y_mean_t = torch.from_numpy(Y_mean).to(device)
+    Y_std_t = torch.from_numpy(Y_std).to(device)
+
+    total = 0
+    collided = 0
+
+    for X, _ in loader:
+        X = X.to(device)
+        Yp = model(X)  # (B, 6, 3)
+
+        # Denormalize predictions
+        Yp_den = Yp * Y_std_t + Y_mean_t
+
+        # Denormalize inputs
+        X_den = X * X_std_t + X_mean_t
+
+        # For each trajectory in batch
+        for i in range(X.size(0)):
+            # Extract points
+            x0, y0, z0 = X_den[i, 0].cpu().numpy()
+            xf, yf, zf = X_den[i, 1].cpu().numpy()
+            ox, oy, oz = X_den[i, 2].cpu().numpy()
+            cpx, cpy, cpz = X_den[i, 3].cpu().numpy()
+
+            pred_points = Yp_den[i].cpu().numpy()  # (6, 3)
+            cp3 = pred_points[0]
+            cp4 = pred_points[1]
+            cp5 = pred_points[2]
+            cp6 = pred_points[3]
+            cp7 = pred_points[4]
+            cp8 = pred_points[5]
+
+            # Build control point arrays with cp5 duplicated
+            control_points_x = np.array([x0, cpx, cp3[0], cp4[0], cp5[0],
+                                         cp5[0], cp6[0], cp7[0], cp8[0], xf])
+            control_points_y = np.array([y0, cpy, cp3[1], cp4[1], cp5[1],
+                                         cp5[1], cp6[1], cp7[1], cp8[1], yf])
+            control_points_z = np.array([z0, cpz, cp3[2], cp4[2], cp5[2],
+                                         cp5[2], cp6[2], cp7[2], cp8[2], zf])
+
+            # Evaluate continuous trajectory
+            tknots = np.array([0, 0.5, 1.0])
+            t_eval = np.linspace(0, 1, n_eval)
+
+            traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
+            traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
+            traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
+
+            # Stack into (n_eval, 3)
+            trajectory = np.column_stack([traj_x, traj_y, traj_z])
+
+            # Compute distances to obstacle center
+            obstacle_center = np.array([ox, oy, oz])
+            distances = np.linalg.norm(trajectory - obstacle_center, axis=1)
+
+            # Check if any point violates the constraint
+            if np.any(distances < radius - buffer):
+                collided += 1
+
+            total += 1
+
+    return collided / max(total, 1)
+
+def find_collision_samples(model, dataset, radius=0.1, n_eval=50, n_samples=None):
+    """
+    Find all samples in dataset that have bpoly trajectory collisions.
+
+    Args:
+        model: trained model
+        dataset: TrajDataset (test_ds or train_ds)
+        radius: obstacle radius
+        n_eval: number of points to evaluate along curve
+        n_samples: if provided, only check first n_samples (for speed)
+
+    Returns:
+        collision_indices: list of dataset indices that collide
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    collision_indices = []
+    n_check = n_samples if n_samples else len(dataset)
+
+    print(f"Checking {n_check} samples for collisions...")
+
+    for i in range(n_check):
+        if i % 100 == 0:
+            print(f"  Checked {i}/{n_check}...")
+
+        X, Y_true = dataset[i]
+        X_batch = X.unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            Yp = model(X_batch)
+
+        # Denormalize
+        X_mean_t = torch.from_numpy(X_mean).to(device)
+        X_std_t = torch.from_numpy(X_std).to(device)
+        Y_mean_t = torch.from_numpy(Y_mean).to(device)
+        Y_std_t = torch.from_numpy(Y_std).to(device)
+
+        X_den = X_batch * X_std_t + X_mean_t
+        Yp_den = Yp * Y_std_t + Y_mean_t
+
+        # Extract points
+        x0, y0, z0 = X_den[0, 0].cpu().numpy()
+        xf, yf, zf = X_den[0, 1].cpu().numpy()
+        ox, oy, oz = X_den[0, 2].cpu().numpy()
+        cpx, cpy, cpz = X_den[0, 3].cpu().numpy()
+
+        pred_points = Yp_den[0].cpu().numpy()
+        cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+
+        # Build control points
+        control_points_x = np.array([x0, cpx, cp3[0], cp4[0], cp5[0],
+                                     cp5[0], cp6[0], cp7[0], cp8[0], xf])
+        control_points_y = np.array([y0, cpy, cp3[1], cp4[1], cp5[1],
+                                     cp5[1], cp6[1], cp7[1], cp8[1], yf])
+        control_points_z = np.array([z0, cpz, cp3[2], cp4[2], cp5[2],
+                                     cp5[2], cp6[2], cp7[2], cp8[2], zf])
+
+        # Evaluate trajectory
+        tknots = np.array([0, 0.5, 1.0])
+        t_eval = np.linspace(0, 1, n_eval)
+
+        traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
+        traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
+        traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
+
+        trajectory = np.column_stack([traj_x, traj_y, traj_z])
+        obstacle_center = np.array([ox, oy, oz])
+        distances = np.linalg.norm(trajectory - obstacle_center, axis=1)
+
+        # Check collision
+        if np.any(distances < radius):
+            collision_indices.append(i)
+
+    print(f"\nFound {len(collision_indices)} collision samples out of {n_check}")
+    print(f"Collision rate: {100 * len(collision_indices) / n_check:.2f}%")
+
+    return collision_indices
 
 # Scheduled LR
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -498,8 +870,7 @@ scheduler = optim.lr_scheduler.ReduceLROnPlateau(
     patience = 3, # wait 3 epochs before reducing
 )
 
-# Train a few epochs
-EPOCHS = 1
+EPOCHS = 20
 train_losses = []
 if TRAIN:
     for epoch in range(EPOCHS):
@@ -512,7 +883,8 @@ if TRAIN:
         test_mse_hist.append(te)
 
         # collision rate this epoch (denormed, 3D)
-        coll = count_collisions(model, test_dl, radius=0.1)
+        #coll = count_collisions_continuous(model, test_dl, radius=0.1, buffer = 0, n_eval=50)
+        coll = count_collisions(model, test_dl)
         coll_rate_hist.append(coll)
 
         scheduler.step(te)
@@ -585,14 +957,40 @@ if TIME_EVAL:
 # Standard evaluation
 print("\nComputing test metrics...")
 test_mse = eval_epoch(test_dl)
-test_coll = count_collisions(model, test_dl, radius=0.1)
+#test_coll = count_collisions_continuous(model, test_dl, radius=0.1, buffer = 0, n_eval=50)
+test_coll = count_collisions(model, test_dl)
 print(f"Test MSE: {test_mse:.6f}")
 print(f"Test collision rate: {test_coll * 100:.2f}%")
 
 # plot first 3 validation samples
 plot_many_samples(model, test_ds, indices=[0,1,2], title_prefix="test")
-_ = excel_row_from_test_idx(2)
-
+#_ = excel_row_from_test_idx(2)
 
 # or one specific index and save it
 #plot_dataset_sample(model, test_ds, idx=5, save_path="test_sample_005.png")
+
+if VISCOL:
+    # Find and visualize collision samples
+    print("\n" + "=" * 60)
+    print("FINDING COLLISION SAMPLES")
+    print("=" * 60)
+
+    collision_indices = find_collision_samples(model, test_ds, radius=0.1, n_eval=50)
+
+    if len(collision_indices) > 0:
+        print(f"\nVisualizing first collision sample...")
+        plot_collision_sample(model, test_ds, idx=collision_indices[0])
+
+        # Get Excel row for this collision
+        excel_row_from_test_idx(collision_indices[0])
+
+        # Optionally visualize a few more
+        if len(collision_indices) > 1:
+            print(f"\nVisualizing second collision sample...")
+            plot_collision_sample(model, test_ds, idx=collision_indices[1])
+
+        if len(collision_indices) > 2:
+            print(f"\nVisualizing third collision sample...")
+            plot_collision_sample(model, test_ds, idx=collision_indices[2])
+    else:
+        print("No collisions found! 🎉")

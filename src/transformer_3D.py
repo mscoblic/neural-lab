@@ -516,7 +516,7 @@ class TrajDataset(Dataset):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 T_in = 4
-file_path = "../data/collision_3D_freevelocity.xlsx"
+file_path = "../data/collision_3D_highervelocity.xlsx"
 df = pd.read_excel(file_path)
 
 # Build 4 semantic tokens, each 2-D: start, end, obstacle, control
@@ -538,24 +538,48 @@ Y_np = df[output_cols].to_numpy(dtype=np.float32)    # (N, 20)
 N = Y_np.shape[0]
 Y_np = Y_np.reshape(N, 3, T_out).transpose(0, 2, 1)  # (N, 7, 2)
 
-# === Normalize inputs and outputs ===
-# Compute mean/std over the full dataset (all samples, all tokens, both x and y)
-X_mean = X_np.mean(axis=0, keepdims=True)        # shape (1, T_in, 2)
-X_std  = X_np.std(axis=0, keepdims=True) + 1e-8
-Y_mean = Y_np.mean(axis=0, keepdims=True)        # shape (1, T_out, 2)
-Y_std  = Y_np.std(axis=0, keepdims=True) + 1e-8
+# Create data
+seed = 42
+rng = np.random.default_rng(seed)
+perm = rng.permutation(N)
 
-# Apply normalization
-X_np = (X_np - X_mean) / X_std
-Y_np = (Y_np - Y_mean) / Y_std
+# Then split
+n_train = int(0.8 * N)
+idx_train = perm[:n_train]
+idx_test  = perm[n_train:]
+
+print(f"n_train: {n_train}, n_test: {len(idx_test)}")
+
+X_train = X_np[idx_train]  # Extract training samples
+Y_train = Y_np[idx_train]
+
+X_mean = X_train.mean(axis=0, keepdims=True)  # (1, 4, 3)
+X_std = X_train.std(axis=0, keepdims=True) + 1e-8
+Y_mean = Y_train.mean(axis=0, keepdims=True)  # (1, 6, 3)
+Y_std = Y_train.std(axis=0, keepdims=True) + 1e-8
+
+# === 4. APPLY NORMALIZATION TO ALL DATA (using training stats) ===
+X_np_normalized = (X_np - X_mean) / X_std  # Apply to full array
+Y_np_normalized = (Y_np - Y_mean) / Y_std
+
+train_ds = TrajDataset(X_np_normalized[idx_train], Y_np_normalized[idx_train])
+test_ds = TrajDataset(X_np_normalized[idx_test], Y_np_normalized[idx_test])
+
+print("\n=== Normalization Check ===")
+print(f"Training X - mean: {X_np_normalized[idx_train].mean():.6f}, std: {X_np_normalized[idx_train].std():.6f}")
+print(f"Training Y - mean: {Y_np_normalized[idx_train].mean():.6f}, std: {Y_np_normalized[idx_train].std():.6f}")
+print(f"Test X - mean: {X_np_normalized[idx_test].mean():.6f}, std: {X_np_normalized[idx_test].std():.6f}")
+print(f"Test Y - mean: {Y_np_normalized[idx_test].mean():.6f}, std: {Y_np_normalized[idx_test].std():.6f}")
+print("Training should be ~0 mean, ~1 std. Test will be slightly different.")
+
+# === 7. SAVE STATS (for inference later) ===
+np.savez("norm_stats.npz",
+         X_mean=X_mean, X_std=X_std,
+         Y_mean=Y_mean, Y_std=Y_std)
 
 if DEBUG == True:
     print("X mean/std:", X_np.mean(), X_np.std())
     print("Y mean/std:", Y_np.mean(), Y_np.std())
-
-np.savez("norm_stats.npz",
-         X_mean=X_mean, X_std=X_std,
-         Y_mean=Y_mean, Y_std=Y_std)
 
 if DEBUG == True:
     print("After normalization:")
@@ -573,20 +597,11 @@ d_ff      = 128
 dropout   = 0.2
 output_dim= 3        # (x,y) per step
 max_seq_length = T_in
-batch_size = 32
+batch_size = 64
 lr = 1e-3
 
 if DEBUG == True:
     print("max_seq_length =", max_seq_length)
-
-# Create data
-seed = 42
-rng = np.random.default_rng(seed)
-perm = rng.permutation(N)
-
-n_train = int(0.001 * N)
-idx_train = perm[:n_train]
-idx_test  = perm[n_train:]
 
 # Identify excel row for test data
 def excel_row_from_test_idx(ds_idx):
@@ -600,9 +615,6 @@ def excel_row_from_test_idx(ds_idx):
     # Optional: show the actual row values for sanity
     print(df.iloc[orig_idx])
     return orig_idx, excel_row
-
-train_ds = TrajDataset(X_np[idx_train], Y_np[idx_train])
-test_ds  = TrajDataset(X_np[idx_test],  Y_np[idx_test])
 
 train_dl = DataLoader(train_ds, batch_size, shuffle=True)
 test_dl  = DataLoader(test_ds,  batch_size, shuffle=False)
@@ -870,7 +882,7 @@ scheduler = optim.lr_scheduler.ReduceLROnPlateau(
     patience = 3, # wait 3 epochs before reducing
 )
 
-EPOCHS = 20
+EPOCHS = 1
 train_losses = []
 if TRAIN:
     for epoch in range(EPOCHS):

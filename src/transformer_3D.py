@@ -57,18 +57,19 @@ def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
     if plot_continuous:
         pred_points = Y_pred_denorm.numpy()
 
-        cp3 = pred_points[0]
-        cp4 = pred_points[1]
-        cp5 = pred_points[2]        # duplicate cp
-        cp6 = pred_points[3]
-        cp7 = pred_points[4]
-        cp8 = pred_points[5]
+        cp2 = pred_points[0]
+        cp3 = pred_points[1]
+        cp4 = pred_points[2]
+        cp5 = pred_points[3]        # duplicate cp
+        cp6 = pred_points[4]
+        cp7 = pred_points[5]
+        cp8 = pred_points[6]
 
-        control_points_x = np.array([x0, cpx, cp3[0], cp4[0], cp5[0],
+        control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
                                      cp5[0], cp6[0], cp7[0], cp8[0], xf])
-        control_points_y = np.array([y0, cpy, cp3[1], cp4[1], cp5[1],
+        control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
                                      cp5[1], cp6[1], cp7[1], cp8[1], yf])
-        control_points_z = np.array([z0, cpz, cp3[2], cp4[2], cp5[2],
+        control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
                                      cp5[2], cp6[2], cp7[2], cp8[2], zf])
 
         tknots = np.array([0, 0.5, 1.0])
@@ -90,7 +91,7 @@ def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
 
     if plot_continuous:
         ax.plot(traj_x, traj_y, traj_z, 'b-', linewidth=2,
-                label='Continuous Trajectory', alpha=0.7, zorder=1)
+                label='piecewise bpoly', alpha=0.7, zorder=1)
 
     # start / end / control / obstacle
     ax.scatter([x0], [y0], [z0], s=80, marker = 'o', label='start', depthshade=False)
@@ -523,9 +524,10 @@ df = pd.read_excel(file_path)
 start    = df[["x0","y0", "z0"]].to_numpy(np.float32)  # (N, 2)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)  # (N, 2)
 obstacle = df[["ox","oy", "oz"]].to_numpy(np.float32)  # (N, 2)
-control  = df[["x2","y2", "z2"]].to_numpy(np.float32)  # (N, 2)
+control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)  # (N, 2)
+#control  = df[["x2","y2", "z2"]].to_numpy(np.float32)  # (N, 2)
 
-output_cols = ["x3", "x4", "x5", "x6", "x7", "x8", "y3", "y4", "y5", "y6", "y7", "y8", "z3", "z4", "z5", "z6", "z7", "z8"]
+output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8", "y2", "y3", "y4", "y5", "y6", "y7", "y8", "z2", "z3", "z4", "z5", "z6", "z7", "z8"]
 T_out = len(output_cols) // 3
 if DEBUG == True:
     print("Derived T_out =", T_out)  # expect 6
@@ -543,7 +545,7 @@ seed = 42
 rng = np.random.default_rng(seed)
 perm = rng.permutation(N)
 
-# Then split
+# train split
 n_train = int(0.8 * N)
 idx_train = perm[:n_train]
 idx_test  = perm[n_train:]
@@ -718,7 +720,7 @@ def count_collisions(model, loader, radius=0.1):
     return collided / max(total, 1)
 
 @torch.no_grad()
-def count_collisions_continuous(model, loader, radius=0.1, buffer=0.0, n_eval=50):
+def count_collisions_continuous(model, loader, radius=0.1, buffer=0.0, n_eval=500):
     """
     Count collisions on the continuous Bernstein polynomial trajectory.
 
@@ -795,7 +797,7 @@ def count_collisions_continuous(model, loader, radius=0.1, buffer=0.0, n_eval=50
 
     return collided / max(total, 1)
 
-def find_collision_samples(model, dataset, radius=0.1, n_eval=50, n_samples=None):
+def find_collision_samples(model, dataset, radius=0.1, n_eval=500, n_samples=None, buffer=0):
     """
     Find all samples in dataset that have bpoly trajectory collisions.
 
@@ -866,7 +868,7 @@ def find_collision_samples(model, dataset, radius=0.1, n_eval=50, n_samples=None
         distances = np.linalg.norm(trajectory - obstacle_center, axis=1)
 
         # Check collision
-        if np.any(distances < radius):
+        if np.any(distances < radius - buffer):
             collision_indices.append(i)
 
     print(f"\nFound {len(collision_indices)} collision samples out of {n_check}")
@@ -882,7 +884,7 @@ scheduler = optim.lr_scheduler.ReduceLROnPlateau(
     patience = 3, # wait 3 epochs before reducing
 )
 
-EPOCHS = 1
+EPOCHS = 20
 train_losses = []
 if TRAIN:
     for epoch in range(EPOCHS):
@@ -899,10 +901,10 @@ if TRAIN:
         coll = count_collisions(model, test_dl)
         coll_rate_hist.append(coll)
 
-        scheduler.step(te)
-        current_lr = optimizer.param_groups[0]['lr']
+       # scheduler.step(te)
+        #current_lr = optimizer.param_groups[0]['lr']
 
-        print(f"epoch {epoch+1:02d} | train MSE {tr:.6f} | test MSE {te:.6f} | collisions {coll:.2%} | LR {current_lr:.6f}")
+        print(f"epoch {epoch+1:02d} | train MSE {tr:.6f} | test MSE {te:.6f} | collisions {coll:.2%} | LR {lr:.6f}")
 
     # ---- PLOTS ----
     os.makedirs("figs", exist_ok=True)

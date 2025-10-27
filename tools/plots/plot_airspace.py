@@ -6,7 +6,6 @@ from pathlib import Path
 import torch
 import matplotlib.pyplot as plt
 
-from src.config import load_yaml
 from src.data import DataSchema, TrajectoryDataset, prepare_datasets, Normalizer, NormStats
 from src.models import build_model_from_config
 
@@ -28,7 +27,8 @@ def load_norm(norm_path: Path):
             norm_obj.fitted = True
             norm_obj.stats = NormStats(mean=mean, std=std)
 
-    _restore(xs, x_norm); _restore(ys, y_norm)
+    _restore(xs, x_norm)
+    _restore(ys, y_norm)
     return x_norm, y_norm
 
 
@@ -57,16 +57,9 @@ def reconstruct_full(x0y0: torch.Tensor, pred18: torch.Tensor, true18: torch.Ten
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True, help="Path to a specific run folder under runs/")
-    ap.add_argument("--data-config",  default="configs/airspace/data_airspace.yaml")
-    ap.add_argument("--model-config", default="configs/airspace/model_airspace.yaml")
     ap.add_argument("--subset", choices=["train", "val", "test"], default="test")
     ap.add_argument("--num-samples", type=int, default=5, help="samples per figure")
     ap.add_argument("--segment", type=int, default=0, help="plot only this segment (1..6); 0=all")
-    ap.add_argument("--all-segments", action="store_true", help="plot six overlays (segments 1..6)")
-    ap.add_argument("--device", default="cpu")
-    ap.add_argument("--keep-normalized", action="store_true",
-                    help="Do not inverse-normalize inputs/outputs for plots/metrics")
-
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent.parent
@@ -76,18 +69,23 @@ def main():
     norm_path  = run_dir / "norm.json"
     split_path = run_dir / "split_indices.json"
 
-    # ---- splits & norms ----
+    # Load configs from run folder
+    with (run_dir / "configs_used.json").open() as f:
+        configs = json.load(f)
+    data_cfg = configs["data_config"]
+    model_cfg = configs["model_config"]
+
+    # Load splits
     with split_path.open("r") as f:
         splits = json.load(f)
 
     x_norm_saved, y_norm_saved = load_norm(norm_path)
 
-    # ---- raw dataset ----
-    data_cfg = load_yaml(root / args.data_config)
+    # Rebuild raw dataset
     schema = DataSchema(
         header=data_cfg["schema"]["header"],
         input_cols=data_cfg["schema"]["input_cols"],
-        output_slices=[list(s) for s in data_cfg["schema"]["output_slices"]],  # Change tuple to list too
+        output_slices=[list(s) for s in data_cfg["schema"]["output_slices"]],
         infer_T_from_outputs=data_cfg["schema"].get("infer_T_from_outputs", True),
         K=int(data_cfg["schema"].get("K", 2)),
     )
@@ -98,7 +96,7 @@ def main():
         raw,
         norm_inputs=data_cfg["normalization"]["inputs"],
         norm_outputs=data_cfg["normalization"]["outputs"],
-        val_ratio=0.1, test_ratio=0.1,  # ignored because split_indices provided
+        val_ratio=0.1, test_ratio=0.1,
         seed=42,
         split_indices=splits
     )
@@ -106,34 +104,32 @@ def main():
     ds = ds_map[args.subset]
     T = raw.T
 
-    # ---- model ----
-    model_cfg = load_yaml(root / args.model_config)
+    # Build and load model
     model = build_model_from_config(model_cfg, raw.input_dim, raw.output_dim)
     state = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(state["state_dict"] if "state_dict" in state else state)
-    model.to(args.device)
     model.eval()
 
-    # ---- pull all samples in the chosen subset (normalized) ----
+    # Pull all samples in the chosen subset (normalized)
     Xs, Ys = [], []
     for i in range(len(ds)):
         x_i, y_i = ds[i]
         Xs.append(x_i.unsqueeze(0))
         Ys.append(y_i.unsqueeze(0))
-    X = torch.cat(Xs, dim=0)  # normalized
+    X = torch.cat(Xs, dim=0)
     Y = torch.cat(Ys, dim=0)
 
     X_denorm = X
     Y_true_den = Y
     with torch.no_grad():
-        Y_pred = model(X.to(args.device)).cpu()
+        Y_pred = model(X).cpu()
     Y_pred_den = Y_pred
 
-    # reconstruct full curves
+    # Reconstruct full curves
     full_pred_x, full_pred_y, full_true_x, full_true_y = reconstruct_full(X_denorm[:, :2], Y_pred_den, Y_true_den)
     seg_ids = segment_from_onehot(X_denorm)
 
-    # helper: plot an overlay for a given segment id
+    # Helper: plot an overlay for a given segment id
     def plot_overlay_for_segment(seg_id: int, max_k: int):
         mask = (seg_ids == seg_id).nonzero(as_tuple=True)[0]
         if mask.numel() == 0:
@@ -149,19 +145,22 @@ def main():
                      label="pred" if first else None)
             first = False
         plt.title(f"{run_dir.name} | {args.subset} overlay — segment {seg_id}")
-        plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal"); plt.legend(); plt.tight_layout()
+        plt.xlabel("x")
+        plt.ylabel("y")
+        plt.axis("equal")
+        plt.legend()
+        plt.tight_layout()
         out_png = run_dir / f"airspace_overlay_{args.subset}_segment{seg_id}.png"
-        plt.savefig(out_png, dpi=160, bbox_inches="tight"); plt.close()
+        plt.savefig(out_png, dpi=160, bbox_inches="tight")
+        plt.close()
         print(f"[SAVED] {out_png}")
 
-    # ---- modes ----
-    if args.all_segments:
-        for seg in range(1, 7):
-            plot_overlay_for_segment(seg, args.num_samples)
-    elif 1 <= args.segment <= 6:
+    # Plot based on segment argument
+    if 1 <= args.segment <= 6:
+        # Plot overlay for specific segment
         plot_overlay_for_segment(args.segment, args.num_samples)
     else:
-        # default: just plot the first N arbitrary samples (mixed segments)
+        # Default: plot the first N arbitrary samples (mixed segments)
         n = min(args.num_samples, X.shape[0])
         for j in range(n):
             plt.figure()
@@ -169,9 +168,14 @@ def main():
             plt.plot(full_pred_x[j].numpy(), full_pred_y[j].numpy(), "--", label="pred")
             seg = int(seg_ids[j].item())
             plt.title(f"{run_dir.name} | {args.subset} sample {j} | seg {seg}")
-            plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal"); plt.legend(); plt.tight_layout()
+            plt.xlabel("x")
+            plt.ylabel("y")
+            plt.axis("equal")
+            plt.legend()
+            plt.tight_layout()
             out_png = run_dir / f"airspace_sample_{args.subset}_{j:03d}.png"
-            plt.savefig(out_png, dpi=160, bbox_inches="tight"); plt.close()
+            plt.savefig(out_png, dpi=160, bbox_inches="tight")
+            plt.close()
             print(f"[SAVED] {out_png}")
 
 if __name__ == "__main__":

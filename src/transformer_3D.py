@@ -14,7 +14,6 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root / 'tools' / 'extra'))
 from BeBOT import PiecewiseBernsteinPoly
 from BeBOT import BernsteinPoly
-import matplotlib.animation as animation
 
 # Enable/disable training
 TRAIN = True

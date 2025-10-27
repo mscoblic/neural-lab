@@ -37,14 +37,14 @@ def load_norm(norm_path: Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True, help="Path to a specific run folder under runs/")
-    ap.add_argument("--data-config", default="configs/data_airspace.yaml")
-    ap.add_argument("--model-config", default="configs/model_airspace.yaml")
+    ap.add_argument("--data-config", default="configs/brachi/data_brachi.yaml")
+    ap.add_argument("--model-config", default="configs/brachi/model_brachi.yaml")
     ap.add_argument("--num-samples", type=int, default=5)
     ap.add_argument("--subset", choices=["train", "val", "test"], default="test")
     args = ap.parse_args()
 
 
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent.parent
     run_dir = (root / args.run_dir).resolve()
     ckpt_path = run_dir / "model_best.pt"
     norm_path = run_dir / "norm.json"
@@ -63,8 +63,9 @@ def main():
     schema = DataSchema(
         header=data_cfg["schema"]["header"],
         input_cols=data_cfg["schema"]["input_cols"],
-        output_slices=[tuple(s) for s in data_cfg["schema"]["output_slices"]],
+        output_slices=[list(s) for s in data_cfg["schema"]["output_slices"]],  # Change tuple to list
         infer_T_from_outputs=data_cfg["schema"].get("infer_T_from_outputs", True),
+        K=int(data_cfg["schema"].get("K", 2)),  # ADD THIS
     )
     ds = TrajectoryDataset(root / data_cfg["excel_path"], schema)
     T = ds.T

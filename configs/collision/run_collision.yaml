@@ -6,7 +6,7 @@
 
   seed: 42                  # set random seed for reproducibility
   device: auto              # auto/cpu/cuda
-  epochs: 100               # max number of times the entire training dataset is seen
+  epochs: 5               # max number of times the entire training dataset is seen
   batch_size: 64            # number of samples processed together in each pass
   lr: 0.001                 # learning rate, small = low/stable, large = fast/risk of divergence
   val_split: 0.1            # validation split

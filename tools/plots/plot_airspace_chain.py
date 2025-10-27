@@ -69,7 +69,7 @@ def main():
     ap.add_argument("--save-csv", action="store_true", help="Also save (x,y) as CSV")
     args = ap.parse_args()
 
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent.parent
     run_dir = (root / args.run_dir).resolve()
     ckpt_path  = run_dir / "model_best.pt"
     norm_path  = run_dir / "norm.json"
@@ -84,8 +84,9 @@ def main():
     schema = DataSchema(
         header=data_cfg["schema"]["header"],
         input_cols=data_cfg["schema"]["input_cols"],
-        output_slices=[tuple(s) for s in data_cfg["schema"]["output_slices"]],
+        output_slices=[list(s) for s in data_cfg["schema"]["output_slices"]],
         infer_T_from_outputs=data_cfg["schema"].get("infer_T_from_outputs", True),
+        K=int(data_cfg["schema"].get("K", 2)),  # ADD THIS
     )
     raw = TrajectoryDataset(str((root / data_cfg["excel_path"]).resolve()), schema, task_name=data_cfg["task_name"])
 

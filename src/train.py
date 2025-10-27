@@ -171,7 +171,7 @@ def main():
     schema = DataSchema(
         header=data_cfg["schema"]["header"],
         input_cols=data_cfg["schema"]["input_cols"],
-        output_slices=[tuple(s) for s in data_cfg["schema"]["output_slices"]],
+        output_slices=[list(s) for s in data_cfg["schema"]["output_slices"]],
         infer_T_from_outputs=data_cfg["schema"].get("infer_T_from_outputs", True),
         K=int(data_cfg["schema"].get("K")),
     )

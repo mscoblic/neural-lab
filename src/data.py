@@ -60,20 +60,16 @@ class TrajectoryDataset(Dataset):
         df = pd.read_excel(excel_path, header=schema.header, engine="openpyxl")
 
         # Inputs
-        X = (
-            df.iloc[:, list(schema.input_cols)]
-              .to_numpy(dtype=np.float32)
-        )
+        X = df[schema.input_cols].to_numpy(dtype=np.float32)
+
         # Outputs
         parts = []
         total_out = 0
-        for start, stop in schema.output_slices:
-            arr = (
-                df.iloc[:, start:stop]
-                  .to_numpy(dtype=np.float32)
-            )
+        for col_list in schema.output_slices:
+            col_list = list(col_list)
+            arr = df[col_list].to_numpy(dtype=np.float32)
             parts.append(arr)
-            total_out += (stop - start)
+            total_out += len(col_list)  # ADD THIS
         Y = np.hstack(parts).astype(np.float32, copy=False)
 
         # ----------------------------------------------------------------------------------

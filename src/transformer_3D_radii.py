@@ -5,12 +5,14 @@ import torch.optim as optim
 import math
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import os
 import sys
 from pathlib import Path
 import time
+from matplotlib.animation import FuncAnimation, PillowWriter
 import plotly.graph_objects as go
+
+
 
 # Import BeBOT
 project_root = Path(__file__).resolve().parent.parent
@@ -25,10 +27,138 @@ TIME_EVAL = False   # run timing benchmark
 VISCOL = False      # if true, search and visualize collision samples
 SELF_EVAL = True   # user input (bottom of script)
 
+def animate_radius_sweep(model, test_input_base, save_path="radius_sweep.gif",
+                         elev=45, azim=-70, n_eval=50):
+    """
+    Create animation sweeping through different obstacle radii
 
-# Converts tensors into arrays for plotting
-def _to_np(t):
-   return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
+    Args:
+        model: trained model
+        test_input_base: base test input array (1, 5, 3) with radius at index 4
+        save_path: where to save the GIF
+        elev, azim: camera angles
+        n_eval: number of points for Bernstein polynomial evaluation
+    """
+    # Hardcoded parameters
+    radius_min = 0.01
+    radius_max = 0.20
+    num_frames = 30
+
+    radii = np.linspace(radius_min, radius_max, num_frames)
+
+    # DIAGNOSTIC: Check if predictions actually change
+    print("\n=== Checking if model responds to radius changes ===")
+    for i, r in enumerate([radii[0], radii[num_frames // 2], radii[-1]]):
+        test_input = test_input_base.copy()
+        test_input[0, 4] = [r, r, r]  # ← FIX THIS
+        test_input_norm = (test_input - X_mean) / X_std
+        test_input_tensor = torch.from_numpy(test_input_norm).to(device)
+
+        with torch.no_grad():
+            output_norm = model(test_input_tensor)
+            output = output_norm.cpu().numpy() * Y_std + Y_mean
+
+        print(f"Radius {r:.3f}: First CP = {output[0, 0]}")
+    print("If these are nearly identical, the model isn't using radius!\n")
+
+    # Extract fixed values from base input
+    sx, sy, sz = test_input_base[0, 0]
+    ex, ey, ez = test_input_base[0, 1]
+    ox, oy, oz = test_input_base[0, 2]
+    cpx, cpy, cpz = test_input_base[0, 3]
+
+    # Setup figure once
+    fig = plt.figure(figsize=(7, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_box_aspect([1, 1, 1])
+
+    def update(frame):
+        ax.clear()
+        ax.view_init(elev=elev, azim=azim)
+
+        # Update radius in test input
+        current_radius = radii[frame]
+        test_input = test_input_base.copy()
+        test_input[0, 4] = [current_radius, current_radius, current_radius]
+
+        # Normalize and predict
+        test_input_norm = (test_input - X_mean) / X_std
+        test_input_tensor = torch.from_numpy(test_input_norm).to(device)
+
+        with torch.no_grad():
+            output_norm = model(test_input_tensor)
+            output = output_norm.cpu().numpy() * Y_std + Y_mean
+
+        pred_points = output[0]  # (T_out, 3)
+
+        # Build Bernstein polynomial trajectory
+        cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+
+        control_points_x = np.array([sx, cp2[0], cp3[0], cp4[0], cp5[0],
+                                     cp5[0], cp6[0], cp7[0], cp8[0], ex])
+        control_points_y = np.array([sy, cp2[1], cp3[1], cp4[1], cp5[1],
+                                     cp5[1], cp6[1], cp7[1], cp8[1], ey])
+        control_points_z = np.array([sz, cp2[2], cp3[2], cp4[2], cp5[2],
+                                     cp5[2], cp6[2], cp7[2], cp8[2], ez])
+
+        tknots = np.array([0, 0.5, 1.0])
+        t_eval = np.linspace(0, 1, n_eval)
+
+        traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
+        traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
+        traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
+
+        # Check collision
+        obstacle_center = np.array([ox, oy, oz])
+        trajectory = np.column_stack([traj_x, traj_y, traj_z])
+        distances = np.linalg.norm(trajectory - obstacle_center, axis=1)
+        min_dist = distances.min()
+        collides = np.any(distances < current_radius)
+
+        # Plot trajectory
+        color = 'red' if collides else 'green'
+        ax.plot(traj_x, traj_y, traj_z, color=color, linewidth=2,
+                label='trajectory', alpha=0.7)
+
+        # Start/end points
+        ax.scatter([sx], [sy], [sz], s=80, marker="o", label="start", depthshade=False)
+        ax.scatter([ex], [ey], [ez], s=120, marker="*", label="end", depthshade=False)
+        ax.scatter([ox], [oy], [oz], s=120, color='red', label='obstacle', depthshade=False)
+
+        # Control point
+        ax.scatter([cpx], [cpy], [cpz], s=80, marker='o', label='heading', depthshade=False)
+
+        # Predicted control points
+        for i, cp in enumerate(pred_points):
+            ax.scatter([cp[0]], [cp[1]], [cp[2]], s=28, marker='o',
+                       alpha=0.6, depthshade=False)
+
+        # Obstacle sphere
+        u, v = np.mgrid[0:2 * np.pi:40j, 0:np.pi:20j]
+        xs = ox + current_radius * np.cos(u) * np.sin(v)
+        ys = oy + current_radius * np.sin(u) * np.sin(v)
+        zs = oz + current_radius * np.cos(v)
+        ax.plot_surface(xs, ys, zs, color='red', alpha=0.3, linewidth=0)
+
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_zlim(0, 1)
+        ax.set_title(f"Radius: {current_radius:.3f} | {'COLLISION' if collides else 'SAFE'}")
+        ax.legend(loc="best", fontsize=8)
+        ax.grid(True)
+
+    anim = FuncAnimation(fig, update, frames=num_frames, interval=100, repeat=True)
+
+    print(f"Starting to save animation to {save_path}...")
+    anim.save(save_path, writer=PillowWriter(fps=10))
+    print(f"[SAVED] {save_path}")
+    print(f"File exists: {os.path.exists(save_path)}")  # ← ADD THIS
+
+    plt.close(fig)
+
 
 def plot_sample_interactive_from_input(model, test_input):
     """Interactive 3D plot using Plotly from raw input array"""
@@ -49,7 +179,7 @@ def plot_sample_interactive_from_input(model, test_input):
     xf, yf, zf = test_input[0, 1]
     ox, oy, oz = test_input[0, 2]
     cpx, cpy, cpz = test_input[0, 3]
-    r = 0.1  # radius
+    r = test_input[0, 4, 0]  # radius
 
     # Build trajectory
     pred_points = output[0]  # (T_out, 3)
@@ -132,6 +262,112 @@ def plot_sample_interactive_from_input(model, test_input):
 
     fig.show()  # Opens in browser with full interactivity!
 
+
+
+
+
+def plot_sample_interactive(model, ds, idx):
+    """Interactive 3D plot using Plotly - opens in browser"""
+    model.eval()
+    device = next(model.parameters()).device
+
+    X, Y_true = ds[idx]
+    Y_pred = model(X.unsqueeze(0).to(device))[0].cpu()
+
+    # Denormalize
+    X_mean_t = torch.from_numpy(X_mean.squeeze(0)).to(X.dtype)
+    X_std_t = torch.from_numpy(X_std.squeeze(0)).to(X.dtype)
+    Y_mean_t = torch.from_numpy(Y_mean.squeeze(0)).to(Y_pred.dtype)
+    Y_std_t = torch.from_numpy(Y_std.squeeze(0)).to(Y_pred.dtype)
+
+    X_denorm = X * X_std_t + X_mean_t
+    Y_pred_denorm = Y_pred * Y_std_t + Y_mean_t
+
+    # Extract points
+    x0, y0, z0 = X_denorm[0].tolist()
+    xf, yf, zf = X_denorm[1].tolist()
+    ox, oy, oz = X_denorm[2].tolist()
+    r = X_denorm[4, 0].item()
+    cpx, cpy, cpz = X_denorm[3].tolist()
+
+    # Build trajectory
+    pred_points = _to_np(Y_pred_denorm)
+    cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+
+    control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
+                                 cp5[0], cp6[0], cp7[0], cp8[0], xf])
+    control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
+                                 cp5[1], cp6[1], cp7[1], cp8[1], yf])
+    control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
+                                 cp5[2], cp6[2], cp7[2], cp8[2], zf])
+
+    tknots = np.array([0, 0.5, 1.0])
+    t_eval = np.linspace(0, 1, 50)
+
+    traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
+    traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
+    traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
+
+    # Create figure
+    fig = go.Figure()
+
+    # Trajectory
+    fig.add_trace(go.Scatter3d(
+        x=traj_x, y=traj_y, z=traj_z,
+        mode='lines',
+        line=dict(color='blue', width=4),
+        name='Trajectory'
+    ))
+
+    # Control points
+    fig.add_trace(go.Scatter3d(
+        x=pred_points[:, 0], y=pred_points[:, 1], z=pred_points[:, 2],
+        mode='markers+text',
+        marker=dict(size=6, color='green'),
+        text=[str(i + 1) for i in range(len(pred_points))],
+        textposition='top center',
+        name='Predictions'
+    ))
+
+    # Start/End
+    fig.add_trace(go.Scatter3d(
+        x=[x0, xf], y=[y0, yf], z=[z0, zf],
+        mode='markers',
+        marker=dict(size=10, color=['green', 'orange'], symbol='diamond'),
+        name='Start/End'
+    ))
+
+    # Obstacle sphere
+    u, v = np.mgrid[0:2 * np.pi:20j, 0:np.pi:10j]
+    xs = ox + r * np.cos(u) * np.sin(v)
+    ys = oy + r * np.sin(u) * np.sin(v)
+    zs = oz + r * np.cos(v)
+
+    fig.add_trace(go.Surface(
+        x=xs, y=ys, z=zs,
+        opacity=0.7,
+        colorscale='Reds',
+        showscale=False,
+        name='Obstacle'
+    ))
+
+    fig.update_layout(
+        scene=dict(
+            aspectmode='cube',
+            xaxis=dict(range=[0, 1], title='X'),
+            yaxis=dict(range=[0, 1], title='Y'),
+            zaxis=dict(range=[0, 1], title='Z')
+        ),
+        title=f'Sample {idx} - Interactive (drag to rotate!)'
+    )
+
+    fig.show()  # Opens in browser with full interactivity!
+
+# Converts tensors into arrays for plotting
+def _to_np(t):
+   return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
+
+#REDO
 @torch.no_grad()
 def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
                         elev=45, azim=-70, n_eval=50, plot_continuous=True):
@@ -163,7 +399,9 @@ def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
     x0, y0, z0 = X_denorm[0].tolist()    # start
     xf, yf, zf = X_denorm[1].tolist()    # end
     ox, oy, oz = X_denorm[2].tolist()    # obstacle
+    r = X_denorm[4, 0].tolist()
     cpx, cpy, cpz = X_denorm[3].tolist() # control
+
 
     # --- Build polynomial ---
     if plot_continuous:
@@ -226,11 +464,10 @@ def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
     ax.scatter([cpx], [cpy], [cpz], s=80, marker='o', label='heading control point', depthshade=False)
 
     # draw obstacle sphere (optional visualization)
-    R = 0.1
     u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
-    xs = ox + R * np.cos(u) * np.sin(v)
-    ys = oy + R * np.sin(u) * np.sin(v)
-    zs = oz + R * np.cos(v)
+    xs = ox + r * np.cos(u) * np.sin(v)
+    ys = oy + r * np.sin(u) * np.sin(v)
+    zs = oz + r * np.cos(v)
     ax.plot_surface(xs, ys, zs, color='red', alpha=1, linewidth=0)
 
     # cosmetics
@@ -243,10 +480,12 @@ def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
 
     if save_path:
         fig.savefig(save_path, dpi=160, bbox_inches="tight")
-        plt.close(fig)
+        plt.show()
     else:
         plt.show()
 
+
+#REDO
 @torch.no_grad()
 def plot_collision_sample(model, ds, idx, save_path=None, title_prefix="collision",
                           elev=45, azim=-70, n_eval=50, obstacle_radius=0.1):
@@ -441,7 +680,6 @@ def plot_many_samples(model, ds, indices, title_prefix="test"):
     for j, idx in enumerate(indices):
         plot_dataset_sample(model, ds, idx, title_prefix=title_prefix)
 
-# START HERE
 # Splits input into multiple attention heads, applies attention, combines results
 class MultiHeadAttention(nn.Module):
     # d_model: dimensionality of the input, number of elements in the embedded input
@@ -630,8 +868,8 @@ class TrajDataset(Dataset):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-T_in = 4
-file_path = "../data/CA3D/CA3D_constrained_vel_0to1_10k.xlsx"
+T_in = 5
+file_path = "../data/CA3D/CA3D_variable_radius.xlsx"
 df = pd.read_excel(file_path)
 
 # Build 4 semantic tokens, each 2-D: start, end, obstacle, control
@@ -639,36 +877,58 @@ start    = df[["x0","y0", "z0"]].to_numpy(np.float32)  # (N, 2)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)  # (N, 2)
 obstacle = df[["ox","oy", "oz"]].to_numpy(np.float32)  # (N, 2)
 control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)  # (N, 2)
-#control  = df[["x2","y2", "z2"]].to_numpy(np.float32)  # (N, 2)
 
-output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8","z2", "z3", "z4", "z5", "z6", "z7","z8"]
-#output_cols = ["x3", "x4", "x5", "x6", "x7", "x8", "x9", "y3", "y4", "y5", "y6", "y7", "y8", "y9", "z3", "z4", "z5", "z6", "z7", "z8", "z9"]
+in_radius = df[["radius"]].to_numpy(np.float32)  # (N, 1)
+in_radius = np.repeat(in_radius, 3, axis=1)
+
+output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8", "z2", "z3", "z4", "z5", "z6", "z7","z8"]
 T_out = len(output_cols) // 3
 if DEBUG == True:
     print("Derived T_out =", T_out)
 
-'''
-T_in = 4
-file_path = "../data/collision_3D_highD.xlsx"
-df = pd.read_excel(file_path)
+    # REMOVE
 
-# Build 4 semantic tokens, each 2-D: start, end, obstacle, control
-start    = df[["x0","y0", "z0"]].to_numpy(np.float32)  # (N, 2)
-end      = df[["xf","yf", "zf"]].to_numpy(np.float32)  # (N, 2)
-obstacle = df[["ox","oy", "oz"]].to_numpy(np.float32)  # (N, 2)
-#control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)  # (N, 2)
-control  = df[["x2","y2", "z2"]].to_numpy(np.float32)  # (N, 2)
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
-output_cols = ["x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18",
-               "y3", "y4", "y5", "y6", "y7", "y8", "y9", "y10", "y11", "y12", "y13", "y14", "y15", "y16", "y17", "y18",
-               "z3", "z4", "z5", "z6", "z7", "z8", "z9", "z10", "z11", "z12", "z13", "z14", "z15", "z16", "z17", "z18"]
-T_out = len(output_cols) // 3
-if DEBUG == True:
-    print("Derived T_out =", T_out)  # expect 6
-'''
+# Check obstacle distribution
+obstacles = df[['ox', 'oy', 'oz']].values
+radii = df['radius'].values
+
+fig = plt.figure(figsize=(15, 5))
+
+# 3D obstacle positions
+ax1 = fig.add_subplot(131, projection='3d')
+ax1.scatter(obstacles[:, 0], obstacles[:, 1], obstacles[:, 2],
+            c=radii, s=10, alpha=0.5, cmap='viridis')
+ax1.set_title('Obstacle Positions (colored by radius)')
+ax1.set_xlabel('x'); ax1.set_ylabel('y'); ax1.set_zlabel('z')
+
+# Radius distribution
+ax2 = fig.add_subplot(132)
+ax2.hist(radii, bins=50, edgecolor='black')
+ax2.set_title('Radius Distribution')
+ax2.set_xlabel('Radius')
+
+# Distance from diagonal
+t_proj = (obstacles[:, 0] + obstacles[:, 1] + obstacles[:, 2]) / 3
+dist_from_diag = np.sqrt((obstacles[:, 0] - t_proj)**2 +
+                         (obstacles[:, 1] - t_proj)**2 +
+                         (obstacles[:, 2] - t_proj)**2)
+
+ax3 = fig.add_subplot(133)
+ax3.hist(dist_from_diag, bins=50, edgecolor='black')
+ax3.set_title('Distance from Diagonal Path')
+ax3.set_xlabel('Distance')
+
+plt.tight_layout()
+plt.savefig('figs/data_distribution_analysis.png', dpi=150)
+plt.show()
+
+# REMOVE
 
 # Stack into tokens → (N, 4, 3)
-X_np = np.stack([start, end, obstacle, control], axis=1)
+X_np = np.stack([start, end, obstacle, control, in_radius], axis=1)
 Y_np = df[output_cols].to_numpy(dtype=np.float32)    # (N, 20)
 
 # Targets (unchanged): (N,14) -> (N, 7, 2)
@@ -797,6 +1057,7 @@ def train_one_epoch():
         X, Y = X.to(device), Y.to(device)         # X: (B,T,3), Y: (B,T,2)
         optimizer.zero_grad()
         Y_hat = model(X)                           # (B,T,2)
+
         loss = criterion(Y_hat, Y)
         loss.backward()
         optimizer.step()
@@ -821,6 +1082,7 @@ def eval_epoch(loader):
         running += loss.item() * X.size(0)
     return running / len(loader.dataset)
 
+#REDO
 @torch.no_grad()
 def count_collisions(model, loader, radius=0.1):
     """
@@ -869,6 +1131,7 @@ def count_collisions(model, loader, radius=0.1):
 
     return collided / max(total, 1)
 
+#REDO
 @torch.no_grad()
 def count_collisions_continuous(model, loader, radius=0.1, buffer=0.0, n_eval=500):
     """
@@ -947,6 +1210,7 @@ def count_collisions_continuous(model, loader, radius=0.1, buffer=0.0, n_eval=50
 
     return collided / max(total, 1)
 
+#REDO
 def find_collision_samples(model, dataset, radius=0.1, n_eval=500, n_samples=None, buffer=0):
     """
     Find all samples in dataset that have bpoly trajectory collisions.
@@ -1224,16 +1488,27 @@ print(f"Initial velocity magnitude - max: {all_velocity_magnitudes.max():.4f}")
 print(f"Number with zero velocity (< 0.01): {np.sum(all_velocity_magnitudes < 0.01)}")
 print(f"Percentage with zero velocity: {np.sum(all_velocity_magnitudes < 0.01) / len(all_velocity_magnitudes) * 100:.2f}%")
 
+
 if SELF_EVAL:
     # Create a test input with zero velocity
     test_input = np.array([[
-        [0.0, 0.0, 0.0],   # start: x0, y0, z0
-        [1.0, 1.0, 1.0],   # end: xf, yf, zf
-        [0.7, 0.7, 0.7],   # obstacle: ox, oy, oz
-        [0.2, 0.0, 0.0]    # control: ZERO VELOCITY
-    ]], dtype=np.float32)  # Shape: (1, 4, 3)
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [0.5, 0.5, 0.4],  # ← obstacle slightly off the direct path
+        [0.0, 0.0, 0.0],
+        [0.1, 0.1, 0.1]  # ← repeat radius 3x
+    ]], dtype=np.float32)
+    # Create animation
+
+    #plot_sample_interactive(model, test_ds, idx=0)
 
     plot_sample_interactive_from_input(model, test_input)
+
+
+    animate_radius_sweep(model, test_input,
+                             save_path="figs/radius_sweep.gif",
+                             elev=45, azim=-70, n_eval=50)
+
 
     # Normalize it
     test_input_norm = (test_input - X_mean) / X_std
@@ -1267,19 +1542,19 @@ if SELF_EVAL:
     # Check for collisions
     pred_points = output[0]  # Shape: (17, 3)
     obstacle_center = test_input[0, 2]  # [0.5, 0.5, 0.5]
-    R = 0.1  # obstacle radius
+    obstacle_radius = test_input[0, 3, 0] # extract first element
 
     # Calculate distances from each predicted point to obstacle center
     distances = np.linalg.norm(pred_points - obstacle_center, axis=1)
 
     # Check if any point is inside the obstacle
-    collisions = distances < R
+    collisions = distances < obstacle_radius
     num_collisions = np.sum(collisions)
 
     print("\n=== COLLISION DETECTION ===")
     print(f"Obstacle center: {obstacle_center}")
-    print(f"Obstacle radius: {R}")
-    print(f"Minimum distance to obstacle: {distances.min():.6f}")
+    print(f"Obstacle radius: {obstacle_radius}")
+    print(f"Minimum distance to obstacle: {np.min(distances):.6f}")
     print(f"Number of collision points: {num_collisions}/{len(pred_points)}")
     if num_collisions > 0:
         print("⚠️  COLLISION DETECTED!")

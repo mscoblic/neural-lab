@@ -11,7 +11,7 @@ from src.models import build_model_from_config
 '''
 python -m tools.eval.eval_collisions_3d \
   --run-dir runs/collision_3D_ffn_102725_s42_de9269 \
-  --R 0.10 --verbose
+  --verbose
 '''
 
 def load_norm(norm_path: Path):
@@ -54,7 +54,6 @@ def main():
     ap.add_argument("--run-dir", required=True, help="runs/<name>")
     ap.add_argument("--subset", choices=["train","val","test"], default="test")
     ap.add_argument("--ckpt", default="model_best.pt")
-    ap.add_argument("--R", type=float, default=0.10, help="Obstacle radius (visualization uses the same)")
     ap.add_argument("--save-csv", action="store_true", help="Write per-sample results to collisions.csv in run dir")
     ap.add_argument("--verbose", action="store_true", help="Print progress for each sample")  # <<< NEW
     args = ap.parse_args()
@@ -102,6 +101,7 @@ def main():
         # obstacle center from inputs
         ox, oy, oz = x_row[6].item(), x_row[7].item(), x_row[8].item()
         c = torch.tensor([ox, oy, oz], dtype=torch.float32)
+        r = x_row[9].item()
 
         # predict and denormalize
         with torch.no_grad():
@@ -112,10 +112,10 @@ def main():
         pts = pred_3xT.T  # (T,3)
 
         # collision checks: point hits OR segment intersections
-        point_hits = sum(int(_point_in_sphere(pts[t], c, args.R)) for t in range(T))
+        point_hits = sum(int(_point_in_sphere(pts[t], c, r)) for t in range(T))
         seg_hits = 0
         for t in range(T - 1):
-            if _segment_hits_sphere(pts[t], pts[t + 1], c, args.R):
+            if _segment_hits_sphere(pts[t], pts[t + 1], c, r):
                 seg_hits += 1
 
         collides = (point_hits > 0) or (seg_hits > 0)

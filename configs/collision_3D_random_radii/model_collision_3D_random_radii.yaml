@@ -1,0 +1,14 @@
+# File: model_collision.yaml
+# Author: Mia Scoblic
+# Date: 2025-08-15
+# Description:
+#     This file creates the neural network architecture
+
+# type of model (src/models.py)
+kind: ffn
+ffn:
+  hidden_dim: 128
+  n_hidden: 3
+  activation: relu        # relu/gelu/tanh
+  # randomly turn of neurons, improves generalization and reduces overfitting
+  dropout: 0.0

@@ -1,9 +1,0 @@
-{
-  "meta": {
-    "task_name": "collision_3D",
-    "T": 9,
-    "input_dim": 12,
-    "output_dim": 27,
-    "excel_path": "/Users/mia/PycharmProjects/trajectory_nn/data/collision_3D.xlsx"
-  }
-}

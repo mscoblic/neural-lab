@@ -1,9 +1,0 @@
-{
-  "meta": {
-    "task_name": "collision_heading",
-    "T": 10,
-    "input_dim": 7,
-    "output_dim": 20,
-    "excel_path": "/Users/mia/PycharmProjects/trajectory_nn/data/collision_heading.xlsx"
-  }
-}

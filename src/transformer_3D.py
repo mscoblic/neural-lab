@@ -21,7 +21,7 @@ from BeBOT import PiecewiseBernsteinPoly
 TRAIN = False        # train or load saved model
 MODEL_PATH = "models/best_model.pth"
 DEBUG = False       # prints shapes for sanity
-TIME_EVAL = False   # run timing benchmark
+TIME_EVAL = True   # run timing benchmark
 VISCOL = False      # if true, search and visualize collision samples
 SELF_EVAL = True   # user input (bottom of script)
 
@@ -30,6 +30,7 @@ SELF_EVAL = True   # user input (bottom of script)
 def _to_np(t):
    return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
 
+'''
 def plot_sample_interactive_from_input(model, test_input):
     """Interactive 3D plot using Plotly from raw input array"""
     model.eval()
@@ -103,7 +104,7 @@ def plot_sample_interactive_from_input(model, test_input):
         x=[cpx], y=[cpy], z=[cpz],
         mode='markers',
         marker=dict(size=8, color='purple'),
-        name='Heading CP'
+        name='Initial Velocity'
     ))
 
     # Obstacle sphere
@@ -125,12 +126,168 @@ def plot_sample_interactive_from_input(model, test_input):
             aspectmode='cube',
             xaxis=dict(range=[0, 1], title='X'),
             yaxis=dict(range=[0, 1], title='Y'),
-            zaxis=dict(range=[0, 1], title='Z')
+            zaxis=dict(range=[0, 1], title='Z'),
+            camera=dict(
+                eye=dict(x=1.6, y=-1.3, z=1.2),
+                center=dict(x=0, y=0, z=0),
+                up=dict(x=0, y=0, z=1),
+            )
         ),
-        title=f'Zero Velocity Test - Interactive (drag to rotate!)'
+        title=f'Center Obstacle Test - 0.699'
+    )
+    fig.write_image("my_trajectory.png")
+    fig.show()  # Opens in browser with full interactivity!
+'''
+
+
+# this function is same as above, but allows for sweeping of inputs for gif
+def plot_sample_interactive_from_input(model, test_input, *,
+                                       save_path=None, title=None, show=False):
+
+    import time
+    t0 = time.perf_counter()
+
+    print("\n[plot] ===============================================")
+    print("[plot] Starting interactive plot generation…")
+
+    # ------------------------------------------------------
+    # Normalize input
+    print("[plot] Normalizing input…")
+    test_input_norm = (test_input - X_mean) / X_std
+    test_input_tensor = torch.from_numpy(test_input_norm).to(
+        next(model.parameters()).device
     )
 
-    fig.show()  # Opens in browser with full interactivity!
+    # ------------------------------------------------------
+    # Forward pass
+    print("[plot] Running model inference…")
+    with torch.no_grad():
+        output_norm = model(test_input_tensor)
+
+    print("[plot] Model output (normalized) shape:", output_norm.shape)
+
+    # Denormalize
+    output = output_norm.cpu().numpy() * Y_std + Y_mean
+    print("[plot] Output denormalized.")
+
+    # ------------------------------------------------------
+    # Extract tokens
+    print("[plot] Extracting tokens (start, end, obstacle, control)…")
+    x0, y0, z0 = test_input[0, 0]
+    xf, yf, zf = test_input[0, 1]
+    ox, oy, oz = test_input[0, 2]
+    cpx, cpy, cpz = test_input[0, 3]
+
+    # ------------------------------------------------------
+    # Build CP trajectory
+    print("[plot] Building Bernstein trajectory…")
+    pred_points = output[0]
+    cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+
+    control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
+                                 cp5[0], cp6[0], cp7[0], cp8[0], xf])
+    control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
+                                 cp5[1], cp6[1], cp7[1], cp8[1], yf])
+    control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
+                                 cp5[2], cp6[2], cp7[2], cp8[2], zf])
+
+    tknots = np.array([0, 0.5, 1.0])
+    t_eval = np.linspace(0, 1, 50)
+
+    traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
+    traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
+    traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
+
+    print("[plot] Trajectory computed.")
+
+    # ------------------------------------------------------
+    # Create Plotly figure
+    print("[plot] Creating figure and adding traces…")
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter3d(
+        x=traj_x, y=traj_y, z=traj_z,
+        mode='lines', line=dict(color='blue', width=4),
+        name='Trajectory'
+    ))
+
+    fig.add_trace(go.Scatter3d(
+        x=pred_points[:, 0], y=pred_points[:, 1], z=pred_points[:, 2],
+        mode='markers+text',
+        marker=dict(size=6, color='green'),
+        text=[str(i + 1) for i in range(len(pred_points))],
+        textposition='top center',
+        name='Predictions'
+    ))
+
+    fig.add_trace(go.Scatter3d(
+        x=[x0, xf], y=[y0, yf], z=[z0, zf],
+        mode='markers',
+        marker=dict(size=10, color=['green', 'orange'], symbol='diamond'),
+        name='Start/End'
+    ))
+
+    fig.add_trace(go.Scatter3d(
+        x=[cpx], y=[cpy], z=[cpz],
+        mode='markers',
+        marker=dict(size=8, color='purple'),
+        name='Initial Velocity'
+    ))
+
+    # Obstacle sphere
+    print("[plot] Adding obstacle sphere…")
+    r = 0.1
+    u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
+    xs = ox + r * np.cos(u) * np.sin(v)
+    ys = oy + r * np.sin(u) * np.sin(v)
+    zs = oz + r * np.cos(v)
+
+    fig.add_trace(go.Surface(
+        x=xs, y=ys, z=zs,
+        opacity=0.7,
+        colorscale='Reds',
+        showscale=False,
+        name='Obstacle'
+    ))
+
+    # ------------------------------------------------------
+    # Layout
+    print("[plot] Updating layout…\n")
+    fig.update_layout(
+        scene=dict(
+            aspectmode='cube',
+            xaxis=dict(range=[0, 1], title='X'),
+            yaxis=dict(range=[0, 1], title='Y'),
+            zaxis=dict(range=[0, 1], title='Z'),
+            camera=dict(
+                eye=dict(x=1.6, y=-1.3, z=1.2),
+                center=dict(x=0, y=0, z=0),
+                up=dict(x=0, y=0, z=1),
+            )
+        ),
+        title=title or "Plot"
+    )
+
+    # ------------------------------------------------------
+    # Save
+    if save_path is not None:
+        print(f"[plot] Saving PNG → {save_path}")
+        fig.write_image(save_path, scale=2)
+
+    # ------------------------------------------------------
+    # Show
+    if show:
+        print("[plot] Displaying figure in browser…")
+
+    dt = time.perf_counter() - t0
+    print(f"[plot] Done in {dt:.3f}s")
+    print("[plot] ===============================================\n")
+
+    if show:
+        fig.show()
+
+    return fig
+
 
 @torch.no_grad()
 def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
@@ -631,7 +788,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 T_in = 4
-file_path = "../data/CA3D/CA3D_constrained_vel_0to1_10k.xlsx"
+file_path = "../data/CA3D/CA3D_middle_obstacle.xlsx"
 df = pd.read_excel(file_path)
 
 # Build 4 semantic tokens, each 2-D: start, end, obstacle, control
@@ -646,26 +803,6 @@ output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", 
 T_out = len(output_cols) // 3
 if DEBUG == True:
     print("Derived T_out =", T_out)
-
-'''
-T_in = 4
-file_path = "../data/collision_3D_highD.xlsx"
-df = pd.read_excel(file_path)
-
-# Build 4 semantic tokens, each 2-D: start, end, obstacle, control
-start    = df[["x0","y0", "z0"]].to_numpy(np.float32)  # (N, 2)
-end      = df[["xf","yf", "zf"]].to_numpy(np.float32)  # (N, 2)
-obstacle = df[["ox","oy", "oz"]].to_numpy(np.float32)  # (N, 2)
-#control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)  # (N, 2)
-control  = df[["x2","y2", "z2"]].to_numpy(np.float32)  # (N, 2)
-
-output_cols = ["x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18",
-               "y3", "y4", "y5", "y6", "y7", "y8", "y9", "y10", "y11", "y12", "y13", "y14", "y15", "y16", "y17", "y18",
-               "z3", "z4", "z5", "z6", "z7", "z8", "z9", "z10", "z11", "z12", "z13", "z14", "z15", "z16", "z17", "z18"]
-T_out = len(output_cols) // 3
-if DEBUG == True:
-    print("Derived T_out =", T_out)  # expect 6
-'''
 
 # Stack into tokens → (N, 4, 3)
 X_np = np.stack([start, end, obstacle, control], axis=1)
@@ -1225,15 +1362,39 @@ print(f"Number with zero velocity (< 0.01): {np.sum(all_velocity_magnitudes < 0.
 print(f"Percentage with zero velocity: {np.sum(all_velocity_magnitudes < 0.01) / len(all_velocity_magnitudes) * 100:.2f}%")
 
 if SELF_EVAL:
+
+    # for sweeping
+
+    # Sweep oz from 0.68 to 0.72 by 0.001 and save PNGs from the *interactive* plot
+    #zsweep = np.arange(0.68, 0.72, 0.001)
+    zsweep = np.arange(0.2, 0.8, 0.01)
+
+    base = np.array([[
+        [0.0, 0.0, 0.0],  # start
+        [1.0, 1.0, 1.0],  # end
+        [0.7, 0.7, 0.699],  # obstacle (oz will be overwritten)
+        [0.0, 0.0, 0.0]  # control: ZERO VELOCITY
+    ]], dtype=np.float32)
+
+    for oz in zsweep:
+        ti = base.copy()
+        ti[0, 2, 0] = float(oz)  # set obstacle z
+        ti[0, 2, 1] = float(oz)  # set obstacle z
+        ti[0, 2, 2] = float(oz)  # set obstacle z
+        fname = f"figs/interactive_sweep/oz_{oz:.3f}.png"
+        title = f"Center Obstacle Test – oz={oz:.3f}"
+        plot_sample_interactive_from_input(model, ti, save_path=fname, title=title, show=False)
+
+
     # Create a test input with zero velocity
     test_input = np.array([[
         [0.0, 0.0, 0.0],   # start: x0, y0, z0
         [1.0, 1.0, 1.0],   # end: xf, yf, zf
-        [0.7, 0.7, 0.7],   # obstacle: ox, oy, oz
-        [0.2, 0.0, 0.0]    # control: ZERO VELOCITY
+        [0.64938, 0.64938, 0.64938],   # obstacle: ox, oy, oz
+        [0.0, 0.0, 0.0]    # control: ZERO VELOCITY
     ]], dtype=np.float32)  # Shape: (1, 4, 3)
 
-    plot_sample_interactive_from_input(model, test_input)
+    #plot_sample_interactive_from_input(model, test_input)
 
     # Normalize it
     test_input_norm = (test_input - X_mean) / X_std

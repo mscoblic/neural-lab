@@ -869,7 +869,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 T_in = 5
-file_path = "../data/CA3D/CA3D_variable_radius.xlsx"
+file_path = "../data/CA3D/CA3D_variable_radius_30k.xlsx"
 df = pd.read_excel(file_path)
 
 # Build 4 semantic tokens, each 2-D: start, end, obstacle, control
@@ -1506,7 +1506,7 @@ if SELF_EVAL:
 
 
     animate_radius_sweep(model, test_input,
-                             save_path="figs/radius_sweep.gif",
+                             save_path="figs/radius_sweep_transformer.gif",
                              elev=45, azim=-70, n_eval=50)
 
 

@@ -23,7 +23,7 @@ MODEL_PATH = "models/best_model.pth"
 DEBUG = False       # prints shapes for sanity
 TIME_EVAL = True   # run timing benchmark
 VISCOL = False      # if true, search and visualize collision samples
-SELF_EVAL = True   # user input (bottom of script)
+SELF_EVAL = False   # user input (bottom of script)
 
 
 # Converts tensors into arrays for plotting
@@ -788,7 +788,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 T_in = 4
-file_path = "../data/CA3D/CA3D_middle_obstacle.xlsx"
+file_path = "../data/CA3D/CA3D_constant_radius_10k.xlsx"
 df = pd.read_excel(file_path)
 
 # Build 4 semantic tokens, each 2-D: start, end, obstacle, control
@@ -1366,24 +1366,24 @@ if SELF_EVAL:
     # for sweeping
 
     # Sweep oz from 0.68 to 0.72 by 0.001 and save PNGs from the *interactive* plot
-    #zsweep = np.arange(0.68, 0.72, 0.001)
-    zsweep = np.arange(0.2, 0.8, 0.01)
+    zsweep = np.arange(0.68, 0.72, 0.001)
+    #zsweep = np.arange(0.2, 0.8, 0.01)
 
     base = np.array([[
         [0.0, 0.0, 0.0],  # start
         [1.0, 1.0, 1.0],  # end
-        [0.7, 0.7, 0.699],  # obstacle (oz will be overwritten)
+        [0.7, 0.7, 0.68],  # obstacle (oz will be overwritten)
         [0.0, 0.0, 0.0]  # control: ZERO VELOCITY
     ]], dtype=np.float32)
 
     for oz in zsweep:
         ti = base.copy()
-        ti[0, 2, 0] = float(oz)  # set obstacle z
-        ti[0, 2, 1] = float(oz)  # set obstacle z
         ti[0, 2, 2] = float(oz)  # set obstacle z
         fname = f"figs/interactive_sweep/oz_{oz:.3f}.png"
         title = f"Center Obstacle Test – oz={oz:.3f}"
         plot_sample_interactive_from_input(model, ti, save_path=fname, title=title, show=False)
+
+        print(f"Obstacle position: {ti[0, 2, :]}")
 
 
     # Create a test input with zero velocity

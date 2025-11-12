@@ -12,6 +12,7 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from src.data import DataSchema, TrajectoryDataset, Normalizer, NormStats
 from src.models import build_model_from_config
 import time
+from scipy import stats
 
 tools_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(tools_dir / 'extra'))
@@ -20,64 +21,84 @@ from BeBOT import PiecewiseBernsteinPoly
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# Add this function to plot_fnn.py after your imports
 @torch.no_grad()
-def time_inference(model, x_norm, sample_input, n_warmup=20, n_iterations=100):
+def time_inference_comparison(model, x_norm, y_norm, dataset, n_samples=100, n_warmup=10):
     """
-    Time model inference with proper GPU synchronization
-
-    Args:
-        model: trained model
-        x_norm: normalizer object
-        sample_input: raw input tensor (13,)
-        n_warmup: number of warmup iterations
-        n_iterations: number of timed iterations
-
-    Returns:
-        dict with timing statistics
+    Compare model-only vs full pipeline timing for FNN
+    Uses INDEPENDENT samples for unbiased measurement
     """
-    print("\n" + "=" * 60)
-    print("TIMING INFERENCE")
-    print("=" * 60)
+    import time
 
-    # Prepare input
-    x_in = x_norm.transform(sample_input.unsqueeze(0))
+    device = next(model.parameters()).device
+    model.eval()
 
     # Warmup
-    print(f"Running {n_warmup} warmup iterations...")
+    x, _ = dataset[0]
+    x_in = x_norm.transform(x.unsqueeze(0)).to(device)
     for _ in range(n_warmup):
-        _ = model(x_in)
+        y_out = model(x_in)
+        _ = y_norm.inverse(y_out)
         if device.type == 'cuda':
             torch.cuda.synchronize()
 
-    # Timed iterations
-    print(f"Running {n_iterations} timed iterations...")
-    times = []
+    # Sample indices - need 2x for independent measurements
+    indices_pipeline = np.random.choice(len(dataset), size=n_samples, replace=False)
+    indices_model = np.random.choice(len(dataset), size=n_samples, replace=False)
 
-    for _ in range(n_iterations):
-        start = time.perf_counter()
+    # === MEASURE FULL PIPELINE ===
+    pipeline_times = []
+    for idx in indices_pipeline:
+        x_raw, _ = dataset[idx]
+
+        t0 = time.perf_counter()
+        x_in = x_norm.transform(x_raw.unsqueeze(0)).to(device)
+        y_norm_out = model(x_in)
+        y_out = y_norm.inverse(y_norm_out)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        pipeline_times.append((t1 - t0) * 1000)
+
+    # === MEASURE MODEL ONLY (separate loop, independent samples) ===
+    model_times = []
+    for idx in indices_model:
+        x_raw, _ = dataset[idx]
+
+        # Pre-normalize (NOT timed)
+        x_in = x_norm.transform(x_raw.unsqueeze(0)).to(device)
+
+        # Time only forward pass
+        t0 = time.perf_counter()
         _ = model(x_in)
         if device.type == 'cuda':
             torch.cuda.synchronize()
-        end = time.perf_counter()
-        times.append((end - start) * 1000)  # Convert to ms
+        t1 = time.perf_counter()
 
-    times = np.array(times)
+        model_times.append((t1 - t0) * 1000)
 
-    # Print statistics
-    print(f"\nSingle sample inference time: {times.mean():.3f}ms ± {times.std():.3f}ms")
-    print(f"Min: {times.min():.3f}ms, Max: {times.max():.3f}ms")
-    print(f"Median: {np.median(times):.3f}ms")
-    print(f"Frequency: {1000 / times.mean():.0f} Hz")
-    print("=" * 60 + "\n")
+    model_times = np.array(model_times)
+    pipeline_times = np.array(pipeline_times)
+    overhead = pipeline_times.mean() - model_times.mean()
+
+    print(f"\n{'=' * 60}")
+    print("FNN INFERENCE TIMING")
+    print(f"{'=' * 60}")
+    print(f"\nModel Only (forward pass):")
+    print(f"  {model_times.mean():.3f} ± {model_times.std():.3f} ms")
+    print(f"  Min: {model_times.min():.3f} ms, Max: {model_times.max():.3f} ms")
+    print(f"  → {1000.0 / model_times.mean():.0f} Hz")
+
+    print(f"\nFull Pipeline (norm + forward + denorm):")
+    print(f"  {pipeline_times.mean():.3f} ± {pipeline_times.std():.3f} ms")
+    print(f"  Min: {pipeline_times.min():.3f} ms, Max: {pipeline_times.max():.3f} ms")
+    print(f"  → {1000.0 / pipeline_times.mean():.0f} Hz")
+
+    print(f"{'=' * 60}\n")
 
     return {
-        'mean_ms': times.mean(),
-        'std_ms': times.std(),
-        'min_ms': times.min(),
-        'max_ms': times.max(),
-        'median_ms': np.median(times),
-        'frequency_hz': 1000 / times.mean()
+        'model_mean': model_times.mean(),
+        'pipeline_mean': pipeline_times.mean(),
     }
 
 def load_norm(norm_path: Path):
@@ -460,17 +481,51 @@ def main():
     model.load_state_dict(state["state_dict"]);
     model.eval()
 
+    model = model.to(device)
+
     # Timing inference
     if args.time_eval:
-        sample_input, _ = ds[0]
-        timing_stats = time_inference(model, x_norm, sample_input)
+
+        # Get test dataset
+        with (run_dir / "split_indices.json").open() as f:
+            splits = json.load(f)
+        test_indices = splits["test"]
+
+        class SubsetDataset:
+            def __init__(self, dataset, indices):
+                self.dataset = dataset
+                self.indices = indices
+
+            def __len__(self):
+                return len(self.indices)
+
+            def __getitem__(self, i):
+                return self.dataset[self.indices[i]]
+
+        test_subset = SubsetDataset(ds, test_indices)
+
+        timing_stats = time_inference_comparison(model, x_norm, y_norm, test_subset, n_samples=100)
+
+        # Save results
+        fnn_results = {
+            'model_only_ms': timing_stats['model_mean'],
+            'full_pipeline_ms': timing_stats['pipeline_mean'],
+            'model_only_hz': 1000.0 / timing_stats['model_mean'],
+            'full_pipeline_hz': 1000.0 / timing_stats['pipeline_mean']
+        }
+
+        with open('fnn_timing_results.json', 'w') as f:
+            json.dump(fnn_results, f, indent=2)
+
+        print("[SAVED] fnn_timing_results.json")
+        return  # Exit after timing
 
     print("\n=== Testing on actual training sample ===")
     # Get a random training sample
     train_idx = 100  # or any index
     x_sample, y_true = ds[train_idx]
     print(f"Sample {train_idx} inputs: {x_sample[:13]}")
-    print(f"Sample radius: {x_sample[12].item():.3f}")
+    print(f"Sample radius: 0.1 (fixed)")
 
     x_in = x_norm.transform(x_sample.unsqueeze(0))
     with torch.no_grad():
@@ -497,7 +552,7 @@ def main():
             0.0, 0.0, 0.0,  # x0, y0, z0 (start)
             1.0, 1.0, 1.0,  # xf, yf, zf (goal)
             0.5, 0.5, 0.4,  # ox, oy, oz (obstacle)
-            0.1,  # r (radius - will be varied in animation)
+            #0.1,  # r (radius - will be varied in animation)
             0.0, 0.0, 0.0  # vx, vy, vz (initial velocity)
 
         ]], dtype=np.float32)

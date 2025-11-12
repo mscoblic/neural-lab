@@ -4,7 +4,7 @@
 # Description:
 #     This file points to an Excel file in the 'data' folder and defines the Excel data layout and normalization techniques
 
-excel_path: data/CA3D/CA3D_constrained_vel_0to1_10k.xlsx
+excel_path: data/CA3D/CA3D_constant_radius_10k.xlsx
 
 schema:
   # define excel header

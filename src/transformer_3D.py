@@ -11,6 +11,9 @@ import sys
 from pathlib import Path
 import time
 import plotly.graph_objects as go
+from scipy import stats
+import json
+
 
 # Import BeBOT
 project_root = Path(__file__).resolve().parent.parent
@@ -26,11 +29,99 @@ VISCOL = False      # if true, search and visualize collision samples
 SELF_EVAL = False   # user input (bottom of script)
 
 
+@torch.no_grad()
+def time_inference_comparison(model, dataset, n_samples=100, n_warmup=10):
+    """
+    Compare model-only vs full pipeline timing for Transformer
+    Uses INDEPENDENT samples for unbiased measurement
+    """
+    import time
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    # Load norm stats
+    X_mean_t = torch.from_numpy(X_mean.squeeze(0)).to(device)
+    X_std_t = torch.from_numpy(X_std.squeeze(0)).to(device)
+    Y_mean_t = torch.from_numpy(Y_mean.squeeze(0)).to(device)
+    Y_std_t = torch.from_numpy(Y_std.squeeze(0)).to(device)
+
+    # Warmup
+    x, _ = dataset[0]
+    x_norm = (x - X_mean_t) / X_std_t
+    x_in = x_norm.unsqueeze(0).to(device)
+    for _ in range(n_warmup):
+        y_out = model(x_in)
+        _ = y_out * Y_std_t + Y_mean_t
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+
+    # Sample indices - need 2x for independent measurements
+    indices_pipeline = np.random.choice(len(dataset), size=n_samples, replace=False)
+    indices_model = np.random.choice(len(dataset), size=n_samples, replace=False)
+
+    # === MEASURE FULL PIPELINE ===
+    pipeline_times = []
+    for idx in indices_pipeline:
+        x_raw, _ = dataset[idx]
+
+        t0 = time.perf_counter()
+        x_norm = (x_raw - X_mean_t) / X_std_t
+        x_in = x_norm.unsqueeze(0).to(device)
+        y_norm_out = model(x_in)
+        y_out = y_norm_out * Y_std_t + Y_mean_t
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        pipeline_times.append((t1 - t0) * 1000)
+
+    # === MEASURE MODEL ONLY (separate loop, independent samples) ===
+    model_times = []
+    for idx in indices_model:
+        x_raw, _ = dataset[idx]
+
+        # Pre-normalize (NOT timed)
+        x_norm = (x_raw - X_mean_t) / X_std_t
+        x_in = x_norm.unsqueeze(0).to(device)
+
+        # Time only forward pass
+        t0 = time.perf_counter()
+        _ = model(x_in)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        model_times.append((t1 - t0) * 1000)
+
+    model_times = np.array(model_times)
+    pipeline_times = np.array(pipeline_times)
+    overhead = pipeline_times.mean() - model_times.mean()
+
+    print(f"\n{'=' * 60}")
+    print("TRANSFORMER INFERENCE TIMING")
+    print(f"{'=' * 60}")
+    print(f"\nModel Only (forward pass):")
+    print(f"  {model_times.mean():.3f} ± {model_times.std():.3f} ms")
+    print(f"  Min: {model_times.min():.3f} ms, Max: {model_times.max():.3f} ms")
+    print(f"  → {1000.0 / model_times.mean():.0f} Hz")
+
+    print(f"\nFull Pipeline (norm + forward + denorm):")
+    print(f"  {pipeline_times.mean():.3f} ± {pipeline_times.std():.3f} ms")
+    print(f"  Min: {pipeline_times.min():.3f} ms, Max: {pipeline_times.max():.3f} ms")
+    print(f"  → {1000.0 / pipeline_times.mean():.0f} Hz")
+
+    print(f"{'=' * 60}\n")
+
+    return {
+        'model_mean': model_times.mean(),
+        'pipeline_mean': pipeline_times.mean(),
+    }
+
 # Converts tensors into arrays for plotting
 def _to_np(t):
    return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
 
-'''
 def plot_sample_interactive_from_input(model, test_input):
     """Interactive 3D plot using Plotly from raw input array"""
     model.eval()
@@ -137,9 +228,8 @@ def plot_sample_interactive_from_input(model, test_input):
     )
     fig.write_image("my_trajectory.png")
     fig.show()  # Opens in browser with full interactivity!
+
 '''
-
-
 # this function is same as above, but allows for sweeping of inputs for gif
 def plot_sample_interactive_from_input(model, test_input, *,
                                        save_path=None, title=None, show=False):
@@ -287,7 +377,7 @@ def plot_sample_interactive_from_input(model, test_input, *,
         fig.show()
 
     return fig
-
+'''
 
 @torch.no_grad()
 def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
@@ -796,7 +886,6 @@ start    = df[["x0","y0", "z0"]].to_numpy(np.float32)  # (N, 2)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)  # (N, 2)
 obstacle = df[["ox","oy", "oz"]].to_numpy(np.float32)  # (N, 2)
 control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)  # (N, 2)
-#control  = df[["x2","y2", "z2"]].to_numpy(np.float32)  # (N, 2)
 
 output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8","z2", "z3", "z4", "z5", "z6", "z7","z8"]
 #output_cols = ["x3", "x4", "x5", "x6", "x7", "x8", "x9", "y3", "y4", "y5", "y6", "y7", "y8", "y9", "z3", "z4", "z5", "z6", "z7", "z8", "z9"]
@@ -1237,41 +1326,22 @@ else:
     model.eval()
     print("Model loaded successfully!")
 
-
 if TIME_EVAL:
-    print("\n" + "=" * 60)
-    print("TIMING INFERENCE")
-    print("=" * 60)
 
-    # Single sample timing (useful for real-time applications)
-    print("\n--- Single Sample Timing ---")
-    single_X = test_ds[0][0].unsqueeze(0).to(device)
+    timing_stats = time_inference_comparison(model, test_ds, n_samples=100)
 
-    # Warmup
-    print("Running warmup iterations...")
-    with torch.no_grad():
-        for _ in range(20):
-            _ = model(single_X)
+    # Save results
+    transformer_results = {
+        'model_only_ms': timing_stats['model_mean'],
+        'full_pipeline_ms': timing_stats['pipeline_mean'],
+        'model_only_hz': 1000.0 / timing_stats['model_mean'],
+        'full_pipeline_hz': 1000.0 / timing_stats['pipeline_mean']
+    }
 
-    # Time many single inferences
-    print("Running timed iterations...")
-    single_times = []
-    with torch.no_grad():
-        for _ in range(100):
-            start = time.perf_counter()
-            _ = model(single_X)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            end = time.perf_counter()
-            single_times.append((end - start) * 1000)  # Convert to ms
+    with open('transformer_timing_results.json', 'w') as f:
+        json.dump(transformer_results, f, indent=2)
 
-    single_times = np.array(single_times)
-    print(f"\nSingle sample inference time: {single_times.mean():.3f}ms ± {single_times.std():.3f}ms")
-    print(f"Min: {single_times.min():.3f}ms, Max: {single_times.max():.3f}ms")
-    print(f"Median: {np.median(single_times):.3f}ms")
-    print(f"Frequency: {1000 / single_times.mean():.0f} Hz")
-
-    print("\n" + "=" * 60)
+    print("[SAVED] transformer_timing_results.json")
 
 # Standard evaluation
 print("\nComputing test metrics...")
@@ -1366,6 +1436,7 @@ if SELF_EVAL:
     # for sweeping
 
     # Sweep oz from 0.68 to 0.72 by 0.001 and save PNGs from the *interactive* plot
+    '''
     zsweep = np.arange(0.68, 0.72, 0.001)
     #zsweep = np.arange(0.2, 0.8, 0.01)
 
@@ -1384,17 +1455,17 @@ if SELF_EVAL:
         plot_sample_interactive_from_input(model, ti, save_path=fname, title=title, show=False)
 
         print(f"Obstacle position: {ti[0, 2, :]}")
-
+    '''
 
     # Create a test input with zero velocity
     test_input = np.array([[
         [0.0, 0.0, 0.0],   # start: x0, y0, z0
         [1.0, 1.0, 1.0],   # end: xf, yf, zf
-        [0.64938, 0.64938, 0.64938],   # obstacle: ox, oy, oz
+        [0.5, 0.5, 0.5],   # obstacle: ox, oy, oz
         [0.0, 0.0, 0.0]    # control: ZERO VELOCITY
     ]], dtype=np.float32)  # Shape: (1, 4, 3)
 
-    #plot_sample_interactive_from_input(model, test_input)
+    plot_sample_interactive_from_input(model, test_input)
 
     # Normalize it
     test_input_norm = (test_input - X_mean) / X_std

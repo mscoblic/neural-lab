@@ -43,8 +43,7 @@ radius = 0.05
 obstacles = []
 start    = df[["x0","y0", "z0"]].to_numpy(np.float32)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)
-initialVel  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)
-control = df[["cpx","cpy", "cpz"]].to_numpy(np.float32)
+control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)
 for i in range(1, numObs + 1):
     obs_i = df[[f"ox{i}", f"oy{i}", f"oz{i}"]].to_numpy(np.float32)
     obstacles.append(obs_i)
@@ -741,7 +740,7 @@ def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=200):
 # ======================================================================================================================
 
 # Stack into tokens
-X_np = np.stack([start, end, *obstacles, initialVel, control], axis=1)
+X_np = np.stack([start, end, *obstacles, control], axis=1)
 Y_np = df[output_cols].to_numpy(dtype=np.float32)
 
 # Split into each dimension

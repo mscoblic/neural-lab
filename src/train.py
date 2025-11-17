@@ -20,6 +20,7 @@ import json
 import torch
 import yaml
 import torch.nn as nn
+import matplotlib.pyplot as plt  # NEW
 # from torch.optim.lr_scheduler import ExponentialLR   # (unused)
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -123,6 +124,40 @@ def eval_one_epoch(model, loader, loss_fn, device, K: int):
         # No validation/test samples; return NaNs so callers can skip early stop on NaN
         return float("nan"), *[float("nan") for _ in range(K)]
     return (total / n, *[t / n for t in axis_totals])
+
+
+# NEW: Plotting function
+def plot_training_curves(train_losses, val_losses, save_path, best_epoch=None):
+    """
+    Plot training and validation loss curves.
+
+    Args:
+        train_losses: List of training MSE values
+        val_losses: List of validation MSE values
+        save_path: Path to save the plot
+        best_epoch: Epoch number with best validation loss (for marking)
+    """
+    plt.figure(figsize=(10, 6))
+    epochs = range(1, len(train_losses) + 1)
+
+    plt.plot(epochs, train_losses, 'b-', label='Train MSE', linewidth=2)
+    plt.plot(epochs, val_losses, 'r-', label='Val MSE', linewidth=2)
+
+    # Mark best epoch if provided
+    if best_epoch is not None and best_epoch <= len(val_losses):
+        plt.axvline(x=best_epoch, color='g', linestyle='--',
+                    label=f'Best epoch ({best_epoch})', alpha=0.7)
+
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('MSE', fontsize=12)
+    plt.title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"[PLOT] Saved training curve to {save_path}")
 
 
 def main():
@@ -304,9 +339,17 @@ def main():
     epochs_since = 0
     best_ckpt = run_dir / "model_best.pt"
 
+    # NEW: Lists to store losses for plotting
+    train_losses = []
+    val_losses = []
+
     for epoch in range(1, epochs + 1):
         train_mse = train_one_epoch(model, train_loader, loss_fn, optimizer, device, grad_clip=grad_clip)
         val_mse, *axis_mse = eval_one_epoch(model, val_loader, loss_fn, device, K)
+
+        # NEW: Store losses
+        train_losses.append(train_mse)
+        val_losses.append(val_mse)
 
         csv_logger.log([epoch, train_mse, val_mse, *axis_mse])
 
@@ -341,6 +384,9 @@ def main():
     print("\a")
 
     csv_logger.close()
+
+    # NEW: Generate and save plot
+    plot_training_curves(train_losses, val_losses, run_dir / "training_curve.png", best_epoch=best_epoch)
 
     # ---- Final test evaluation on held-out set ----
     if test_loader is not None:

@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import torch.optim as optim
 import math
 import numpy as np
@@ -23,48 +24,52 @@ from BeBOT import PiecewiseBernsteinPoly
 # ======================================================================================================================
 # Global definitions
 # ======================================================================================================================
-TRAIN = True        # train or load saved model
+TRAIN = False        # train or load saved model
 MODEL_PATH = "models/best_model.pth"
+COUNT_COL = False
+PLOT_TEST = True
 TIME_EVAL = False   # run timing benchmark
-SELF_EVAL = False   # user input (bottom of script)
+SELF_EVAL = True   # user input (bottom of script)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-file_path = "../data/CA3D/CA3D_multiple_obstacles.xlsx"
+file_path = "../data/CA3D/CA3D_15_obstacles_300k.xlsx"
 df = pd.read_excel(file_path)
 
 # Build 4 tokens
-numObs = 10
+numObs = 15
 radius = 0.05
 obstacles = []
 start    = df[["x0","y0", "z0"]].to_numpy(np.float32)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)
-control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)
+control  = df[["x2","y2", "z2"]].to_numpy(np.float32)
 for i in range(1, numObs + 1):
     obs_i = df[[f"ox{i}", f"oy{i}", f"oz{i}"]].to_numpy(np.float32)
     obstacles.append(obs_i)
-output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8","z2", "z3", "z4", "z5", "z6", "z7","z8"]
+output_cols = ["x3", "x4", "x5", "x6", "x7", "x8", "y3", "y4", "y5", "y6", "y7", "y8", "z3", "z4", "z5", "z6", "z7","z8"]
 
 # Input and Output sizes
 T_in = 3 + numObs
 T_out = len(output_cols) // 3
 
 # Hyperparameters
-EPOCHS = 200
+EPOCHS = 300
 patience_counter = 0
-patience_limit = 200
+patience_limit = 75
 input_dim = 3
-d_model = 64
-num_heads = 4
-num_layers = 2
-d_ff = 128
+d_model = 28
+num_heads = 2
+num_layers = 1
+d_ff = 64
 dropout = 0.2
 output_dim = 3
 max_seq_length = T_in
 batch_size = 64
 lr = 1e-3
-weight_decay = 0.01
+weight_decay = 0.05
+warmup_epochs = 10
+min_lr = 1e-6
 
 # ======================================================================================================================
 # Class definitions
@@ -217,16 +222,20 @@ class TransformerEncoder(nn.Module):
         return self.head(h) if self.head is not None else h
 
 class FlattenMLPHead(nn.Module):
-    def __init__(self, seq_len, d_model, hidden=256, t_out=7, out_dim=2):
+    def __init__(self, seq_len, d_model, hidden=128, t_out=7, out_dim=3, dropout=0.3):
         super().__init__()
         self.seq_len = seq_len
         self.d_model = d_model
-        self.t_out   = t_out
+        self.t_out = t_out
         self.out_dim = out_dim
         self.net = nn.Sequential(
             nn.Linear(seq_len * d_model, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, t_out * out_dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),  # Add intermediate layer
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, t_out * out_dim)
         )
 
     def forward(self, h):  # h: (B, seq_len, d_model)
@@ -250,9 +259,34 @@ class TrajDataset(Dataset):
     def __len__(self):  return self.X.shape[0]
     def __getitem__(self, i):  return self.X[i], self.Y[i]
 
+class CosineAnnealingWarmupScheduler:
+    def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6, max_lr=1e-3):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+        self.current_epoch = 0
+
+    def step(self):
+        if self.current_epoch < self.warmup_epochs:
+            # Linear warmup
+            lr = self.max_lr * (self.current_epoch / self.warmup_epochs)
+        else:
+            # Cosine annealing
+            progress = (self.current_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            lr = self.min_lr + (self.max_lr - self.min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+        self.current_epoch += 1
+        return lr
+
 # ======================================================================================================================
 # Function definitions
 # ======================================================================================================================
+
 # Calculates inference time in forward pass and full pipeline
 @torch.no_grad()
 def time_inference_comparison(model, dataset, n_samples=100, n_warmup=10):
@@ -348,8 +382,8 @@ def _to_np(t):
    return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
 
 # Plots SELF_EVAL in a 3D window for orbiting
-def plot_sample_interactive_from_input(model, test_input):
-    """Interactive 3D plot using Plotly from raw input array"""
+def plot_sample_interactive_from_input(model, test_input, ground_truth=None):
+    """Interactive 3D plot using Plotly from raw input array with optional ground truth"""
     model.eval()
     device = next(model.parameters()).device
 
@@ -368,18 +402,18 @@ def plot_sample_interactive_from_input(model, test_input):
 
     obstacles = test_input[0, 2:2+numObs]
 
-    cpx, cpy, cpz = test_input[0, 2 + numObs]
+    cp2x, cp2y, cp2z = test_input[0, 2 + numObs]
     r = 0.05  # radius
 
-    # Build trajectory
+    # Build predicted trajectory
     pred_points = output[0]  # (T_out, 3)
-    cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+    cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
 
-    control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
+    control_points_x = np.array([x0, cp2x, cp3[0], cp4[0], cp5[0],
                                  cp5[0], cp6[0], cp7[0], cp8[0], xf])
-    control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
+    control_points_y = np.array([y0, cp2y, cp3[1], cp4[1], cp5[1],
                                  cp5[1], cp6[1], cp7[1], cp8[1], yf])
-    control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
+    control_points_z = np.array([z0, cp2z, cp3[2], cp4[2], cp5[2],
                                  cp5[2], cp6[2], cp7[2], cp8[2], zf])
 
     tknots = np.array([0, 0.5, 1.0])
@@ -392,23 +426,55 @@ def plot_sample_interactive_from_input(model, test_input):
     # Create figure
     fig = go.Figure()
 
-    # Trajectory
+    # Predicted Trajectory
     fig.add_trace(go.Scatter3d(
         x=traj_x, y=traj_y, z=traj_z,
         mode='lines',
         line=dict(color='blue', width=4),
-        name='Trajectory'
+        name='Predicted Trajectory'
     ))
 
-    # Control points
+    # Predicted Control points
     fig.add_trace(go.Scatter3d(
         x=pred_points[:, 0], y=pred_points[:, 1], z=pred_points[:, 2],
         mode='markers+text',
         marker=dict(size=6, color='green'),
         text=[str(i + 1) for i in range(len(pred_points))],
         textposition='top center',
-        name='Predictions'
+        name='Predicted CPs'
     ))
+
+    # Ground truth trajectory (if provided)
+    if ground_truth is not None:
+        gt_points = ground_truth[0]  # (T_out, 3)
+        gt_cp3, gt_cp4, gt_cp5, gt_cp6, gt_cp7, gt_cp8 = gt_points
+
+        gt_control_points_x = np.array([x0, cp2x, gt_cp3[0], gt_cp4[0], gt_cp5[0],
+                                        gt_cp5[0], gt_cp6[0], gt_cp7[0], gt_cp8[0], xf])
+        gt_control_points_y = np.array([y0, cp2y, gt_cp3[1], gt_cp4[1], gt_cp5[1],
+                                        gt_cp5[1], gt_cp6[1], gt_cp7[1], gt_cp8[1], yf])
+        gt_control_points_z = np.array([z0, cp2z, gt_cp3[2], gt_cp4[2], gt_cp5[2],
+                                        gt_cp5[2], gt_cp6[2], gt_cp7[2], gt_cp8[2], zf])
+
+        gt_traj_x = PiecewiseBernsteinPoly(gt_control_points_x, tknots, t_eval)[0, :]
+        gt_traj_y = PiecewiseBernsteinPoly(gt_control_points_y, tknots, t_eval)[0, :]
+        gt_traj_z = PiecewiseBernsteinPoly(gt_control_points_z, tknots, t_eval)[0, :]
+
+        # Ground truth trajectory line
+        fig.add_trace(go.Scatter3d(
+            x=gt_traj_x, y=gt_traj_y, z=gt_traj_z,
+            mode='lines',
+            line=dict(color='red', width=4, dash='dash'),
+            name='Ground Truth Trajectory'
+        ))
+
+        # Ground truth control points
+        fig.add_trace(go.Scatter3d(
+            x=gt_points[:, 0], y=gt_points[:, 1], z=gt_points[:, 2],
+            mode='markers',
+            marker=dict(size=6, color='red', symbol='x'),
+            name='Ground Truth CPs'
+        ))
 
     # Start/End
     fig.add_trace(go.Scatter3d(
@@ -420,10 +486,10 @@ def plot_sample_interactive_from_input(model, test_input):
 
     # Heading control point
     fig.add_trace(go.Scatter3d(
-        x=[cpx], y=[cpy], z=[cpz],
+        x=[cp2x], y=[cp2y], z=[cp2z],
         mode='markers',
         marker=dict(size=8, color='purple'),
-        name='Initial Velocity'
+        name='Heading CP'
     ))
 
     # Obstacle sphere
@@ -442,6 +508,7 @@ def plot_sample_interactive_from_input(model, test_input):
             name=f'Obstacle {i+1}'
         ))
 
+    title_str = 'Predicted vs Ground Truth' if ground_truth is not None else 'Predicted Trajectory'
     fig.update_layout(
         scene=dict(
             aspectmode='cube',
@@ -454,124 +521,38 @@ def plot_sample_interactive_from_input(model, test_input):
                 up=dict(x=0, y=0, z=1),
             )
         ),
-        title=f'Center Obstacle Test - 0.699'
+        title=title_str
     )
     fig.write_image("my_trajectory.png")
     fig.show()  # Opens in browser with full interactivity!
 
 # Plots a single test sample
 @torch.no_grad()
-def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test",
-                        elev=45, azim=-70, n_eval=50, plot_continuous=True):
+def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test"):
+    """Plot dataset sample using interactive plotter"""
     model.eval()
-    device = next(model.parameters()).device        # GPU or CPU
 
     # fetch one sample (normalized tensors)
     X, Y_true = ds[idx]  # X: (T_in,3), Y_true: (T_out,3)
-    Y_pred = model(X.unsqueeze(0).to(device))[0].cpu()  # (T_out,3)
 
     # prepare stats
     X_mean_t = torch.from_numpy(X_mean.squeeze(0)).to(X.dtype)
-    X_std_t  = torch.from_numpy(X_std.squeeze(0)).to(X.dtype)
-    Y_mean_t = torch.from_numpy(Y_mean.squeeze(0)).to(Y_pred.dtype)
-    Y_std_t  = torch.from_numpy(Y_std.squeeze(0)).to(Y_pred.dtype)
+    X_std_t = torch.from_numpy(X_std.squeeze(0)).to(X.dtype)
+    Y_mean_t = torch.from_numpy(Y_mean.squeeze(0)).to(Y_true.dtype)
+    Y_std_t = torch.from_numpy(Y_std.squeeze(0)).to(Y_true.dtype)
 
-    # denormalize
-    X_denorm      = X * X_std_t + X_mean_t
+    # denormalize X to get raw input
+    X_denorm = X * X_std_t + X_mean_t
+
+    # denormalize Y_true to get ground truth
     Y_true_denorm = Y_true * Y_std_t + Y_mean_t
-    Y_pred_denorm = Y_pred * Y_std_t + Y_mean_t
 
-    # recover tokens
-    x0, y0, z0 = X_denorm[0].tolist()    # start
-    xf, yf, zf = X_denorm[1].tolist()    # end
+    # Convert to input format: add batch dimension
+    test_input = X_denorm.unsqueeze(0).numpy()  # (1, T_in, 3)
+    ground_truth = Y_true_denorm.unsqueeze(0).numpy()  # (1, T_out, 3)
 
-    obstacles = X_denorm[2:2+numObs].numpy()    # obstacle
-
-    cpx, cpy, cpz = X_denorm[2+numObs].tolist()  # control
-
-    # --- Build polynomial ---
-    if plot_continuous:
-        pred_points = Y_pred_denorm.numpy()
-
-        cp2 = pred_points[0]
-        cp3 = pred_points[1]
-        cp4 = pred_points[2]
-        cp5 = pred_points[3]        # duplicate cp
-        cp6 = pred_points[4]
-        cp7 = pred_points[5]
-        cp8 = pred_points[6]
-
-        control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
-                                     cp5[0], cp6[0], cp7[0], cp8[0], xf])
-        control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
-                                     cp5[1], cp6[1], cp7[1], cp8[1], yf])
-        control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
-                                     cp5[2], cp6[2], cp7[2], cp8[2], zf])
-
-        tknots = np.array([0, 0.5, 1.0])
-        t_eval = np.linspace(0, 1, n_eval)
-
-        traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
-        traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
-        traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
-
-
-    # --- 3D scatter plot ---
-    fig = plt.figure(figsize=(7, 7))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_box_aspect([1, 1, 1])
-    ax.view_init(elev=elev, azim=azim)  # <<< set camera
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_zlim(0, 1)
-
-    if plot_continuous:
-        ax.plot(traj_x, traj_y, traj_z, 'b-', linewidth=2,
-                label='piecewise bpoly', alpha=0.7, zorder=1)
-
-    # start / end / control / obstacle
-    ax.scatter([x0], [y0], [z0], s=80, marker = 'o', label='start', depthshade=False)
-    ax.scatter([xf], [yf], [zf], s=120, marker = '*', label='end', depthshade=False)
-
-    # ground truth points
-    Yt = _to_np(Y_true_denorm)
-    ax.scatter(Yt[:, 0], Yt[:, 1], Yt[:, 2], s=36, color='black', marker='x', label='ground truth', depthshade=False)
-
-    # predicted points
-    Yp = _to_np(Y_pred_denorm)
-    ax.scatter(Yp[:, 0], Yp[:, 1], Yp[:, 2], s=28, marker='o', label='prediction', depthshade=False)
-
-    # label each predicted point
-    for i, (x, y, z) in enumerate(Yp):
-        ax.text(float(x), float(y), float(z), str(i + 1),
-                fontsize=8, ha='left', va='bottom', color='blue')
-
-    ax.scatter([cpx], [cpy], [cpz], s=80, marker='o', label='heading control point', depthshade=False)
-
-    # draw obstacle sphere (optional visualization)
-    R = 0.05
-    u, v = np.mgrid[0:2 * np.pi:20j, 0:np.pi:10j]
-
-    for i, obs in enumerate(obstacles):
-        ox, oy, oz = obs
-        xs = ox + R * np.cos(u) * np.sin(v)
-        ys = oy + R * np.sin(u) * np.sin(v)
-        zs = oz + R * np.cos(v)
-        ax.plot_surface(xs, ys, zs, color='red', alpha=0.3, linewidth=0)
-
-    # cosmetics
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-    ax.set_title(f"{title_prefix} sample idx={idx}")
-    ax.legend()
-    ax.grid(True)
-
-    if save_path:
-        fig.savefig(save_path, dpi=160, bbox_inches="tight")
-        plt.close(fig)
-    else:
-        plt.show()
+    # Call existing interactive plotter with ground truth
+    plot_sample_interactive_from_input(model, test_input, ground_truth=ground_truth)
 
 # Visualize many samples quickly
 @torch.no_grad()
@@ -580,16 +561,53 @@ def plot_many_samples(model, ds, indices, title_prefix="test"):
     for j, idx in enumerate(indices):
         plot_dataset_sample(model, ds, idx, title_prefix=title_prefix)
 
+def plot_lr_schedule(lr_history, save_path="figs/lr_schedule.png"):
+    """
+    Visualize learning rate schedule over training
+
+    Args:
+        lr_history: List of learning rates from each epoch
+        save_path: Path to save the figure
+    """
+    if len(lr_history) == 0:
+        print("Warning: No LR history to plot")
+        return
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(lr_history, linewidth=2, color='blue')
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Learning Rate', fontsize=12)
+    plt.title('Learning Rate Schedule (Warmup + Cosine Annealing)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.yscale('log')
+
+    # Add annotations for warmup phase
+    if len(lr_history) > warmup_epochs:
+        plt.axvline(x=warmup_epochs, color='red', linestyle='--',
+                    alpha=0.5, label=f'Warmup complete (epoch {warmup_epochs})')
+        plt.legend()
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=160, bbox_inches="tight")
+    plt.close()
+    print(f"Saved LR schedule plot to {save_path}")
+
 def train_one_epoch():
     model.train()
     running = 0.0
+
     for X, Y in train_dl:
-        X, Y = X.to(device), Y.to(device)         # X: (B,T,3), Y: (B,T,2)
+        X, Y = X.to(device), Y.to(device)
         optimizer.zero_grad()
-        Y_hat = model(X)                           # (B,T,2)
-        loss = criterion(Y_hat, Y)
+
+        Y_hat = model(X)
+
+        loss=criterion(Y_hat, Y)
+
         loss.backward()
         optimizer.step()
+
         running += loss.item() * X.size(0)
 
     return running / len(train_dl.dataset)
@@ -625,7 +643,7 @@ def count_collisions(model, loader, radius):
         Yp = model(X) # Make predictions
 
         # Denorm predictions
-        Yp_den = Yp * Y_std_t[:, 0, :] + Y_mean_t[:, 0, :]
+        Yp_den = Yp * Y_std_t + Y_mean_t
 
         # Grab obstacles locations and denorm
         obs_norm = X[:, 2:2 + numObs, :]
@@ -646,7 +664,7 @@ def count_collisions(model, loader, radius):
     return collided / max(total, 1)
 
 @torch.no_grad()
-def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=500):
+def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=200):
     model.eval()
     device = next(model.parameters()).device
 
@@ -664,7 +682,7 @@ def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=500):
         Yp = model(X)
 
         # Denormalize predictions (global normalization)
-        Yp_den = Yp * Y_std_t[:, 0, :] + Y_mean_t[:, 0, :]
+        Yp_den = Yp * Y_std_t + Y_mean_t
 
         # Denormalize inputs
         X_den = X * X_std_t + X_mean_t
@@ -680,14 +698,16 @@ def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=500):
 
             # Get predicted control points
             pred_points = Yp_den[i].cpu().numpy()  # (T_out, 3)
-            cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+            cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+
+            cp2x, cp2y, cp2z = X_den[i, -1].cpu().numpy()
 
             # Build control point arrays with cp5 duplicated
-            control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
+            control_points_x = np.array([x0, cp2x, cp3[0], cp4[0], cp5[0],
                                          cp5[0], cp6[0], cp7[0], cp8[0], xf])
-            control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
+            control_points_y = np.array([y0, cp2y, cp3[1], cp4[1], cp5[1],
                                          cp5[1], cp6[1], cp7[1], cp8[1], yf])
-            control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
+            control_points_z = np.array([z0, cp2z, cp3[2], cp4[2], cp5[2],
                                          cp5[2], cp6[2], cp7[2], cp8[2], zf])
 
             # Evaluate continuous trajectory
@@ -728,6 +748,7 @@ N = Y_np.shape[0]
 Y_np = Y_np.reshape(N, 3, T_out).transpose(0, 2, 1)
 
 # Data processing
+N = X_np.shape[0]
 seed = 42
 rng = np.random.default_rng(seed)
 perm = rng.permutation(N)
@@ -780,29 +801,67 @@ encoder = TransformerEncoder(
 ).to(device)
 
 # Build FNN
-head = FlattenMLPHead(seq_len=T_in, d_model=d_model, hidden=256, t_out=T_out, out_dim=output_dim).to(device)
+head = FlattenMLPHead(seq_len=T_in, d_model=d_model, hidden=224, t_out=T_out, out_dim=output_dim).to(device)
 
 # Wraps both together
 model = TrajModel(encoder, head).to(device)
+
+# Check datasize and model size for overfitting
+print("\n=== Model Size to Data Size Check ===")
+total_params = sum(p.numel() for p in model.parameters())
+samples_per_param = len(train_ds) / total_params
+
+print(f"Total parameters: {total_params:,}")
+print(f"Training samples: {len(train_ds):,}")
+print(f"Current ratio: {samples_per_param:.3f} samples/parameter")
+
+print(f"\n--- Recommendations ---")
+
+# Optimal params for current dataset
+optimal_params_min = len(train_ds) // 5  # conservative (5 samples/param)
+optimal_params_max = len(train_ds) // 1  # aggressive (1 sample/param)
+print(f"For {len(train_ds):,} samples, aim for:")
+print(f"  Conservative: {optimal_params_min:,} - {optimal_params_max:,} parameters")
+
+# Optimal dataset for current model
+optimal_samples_min = total_params * 1  # aggressive (1 sample/param)
+optimal_samples_max = total_params * 5  # conservative (5 samples/param)
+print(f"\nFor {total_params:,} parameters, aim for:")
+print(f"  {optimal_samples_min:,} - {optimal_samples_max:,} samples")
+
+# Status indicator
+if samples_per_param < 0.5:
+    status = "⚠️  SEVERE OVERFITTING RISK"
+elif samples_per_param < 1.0:
+    status = "⚠️  HIGH OVERFITTING RISK"
+elif samples_per_param < 3.0:
+    status = "⚡ MODERATE - Watch for overfitting"
+else:
+    status = "✓ GOOD REGIME"
+
+print(f"\nStatus: {status}")
+print(f"{'='*60}\n")
 
 # Pick loss method
 criterion = nn.MSELoss()
 
 # Pick optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr, weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 # Scheduled LR
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+scheduler = CosineAnnealingWarmupScheduler(
     optimizer,
-    mode = 'min', # minimize metric
-    factor = 0.5, # reduce LR by half
-    patience = 3, # wait 3 epochs before reducing
+    warmup_epochs=warmup_epochs,
+    total_epochs=EPOCHS,
+    min_lr=min_lr,
+    max_lr=lr
 )
 
 # Containers for test MSE, collision rate history, training losses
 test_mse_hist = []
 coll_rate_hist = []
 train_losses = []
+lr_history = []
 
 # Track lowest test MSE
 best_test_mse = float('inf')
@@ -819,13 +878,13 @@ if TRAIN:
         test_mse_hist.append(te)
 
         # collision rate for this epoch
-        coll = count_collisions_continuous(model, test_dl, radius, buffer = 0, n_eval=200)
-        #coll = count_collisions(model, test_dl)
-        coll_rate_hist.append(coll)
+        #coll = count_collisions_continuous(model, test_dl, radius, buffer = 0)
+        #coll = count_collisions(model, test_dl, radius)
+        #coll_rate_hist.append(coll)
 
         # update learning rate
-        scheduler.step(te)
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = scheduler.step()
+        lr_history.append(current_lr)
 
         # Early stopping logic
         if te < best_test_mse:      # Save the model if we did better than last time
@@ -841,7 +900,8 @@ if TRAIN:
             break
 
         # Print results
-        print(f"epoch {epoch+1:02d} | train MSE {tr:.6f} | test MSE {te:.6f} | collisions {coll:.2%} | LR {current_lr:.6f}")
+        print(f"epoch {epoch + 1:03d} | train_mse {tr:.4f} | test_mse {te:.4f} | "
+              f"LR {current_lr:.6f} | patience {patience_counter}/{patience_limit}")
 
         # Generate training figures
         os.makedirs("figs", exist_ok=True)
@@ -866,6 +926,14 @@ if TRAIN:
         plt.grid(True); plt.legend()
         plt.savefig("figs/mse_over_epochs.png", dpi=160, bbox_inches="tight")
         plt.close()
+
+    print(f"\nTraining complete. Best test MSE: {best_test_mse:.4f}")
+
+    # Visualize LR schedule
+    plot_lr_schedule(lr_history)
+
+    model.load_state_dict(torch.load("models/best_model.pth"))
+
 else:
     # Load the saved model when not training
     print(f"Loading model from {MODEL_PATH}...")
@@ -880,6 +948,34 @@ else:
     Y_std = stats['Y_std']
     print("Model and normalization stats loaded successfully")
 
+print("\n=== Loss Space Verification ===")
+
+# Get one batch
+X_batch, Y_batch = next(iter(test_dl))
+X_batch, Y_batch = X_batch.to(device), Y_batch.to(device)
+
+# Compute normalized loss (what you're seeing)
+with torch.no_grad():
+    Y_pred = model(X_batch)
+    norm_loss = criterion(Y_pred, Y_batch)
+    print(f"Normalized MSE: {norm_loss.item():.6f}")
+
+# Denormalize and compute physical loss
+Y_mean_t = torch.from_numpy(Y_mean).to(device)
+Y_std_t = torch.from_numpy(Y_std).to(device)
+
+Y_batch_phys = Y_batch * Y_std_t + Y_mean_t
+Y_pred_phys = Y_pred * Y_std_t + Y_mean_t
+
+phys_loss = criterion(Y_pred_phys, Y_batch_phys)
+print(f"Physical MSE: {phys_loss.item():.6f}")
+print(f"Physical RMSE: {torch.sqrt(phys_loss).item():.6f}")
+
+# Show the ratio
+print(f"\nRatio (phys/norm): {phys_loss.item() / norm_loss.item():.3f}")
+print(f"Y_std mean: {Y_std.mean():.6f}")
+print(f"Expected ratio ≈ (Y_std)²: {(Y_std.mean()**2):.6f}")
+
 # Evaluate inference time
 if TIME_EVAL:
     timing_stats = time_inference_comparison(model, test_ds, n_samples=100)
@@ -890,44 +986,47 @@ print("\n=== Test Metrics ===")
 # Calculate average MSE on all test samples
 test_mse = eval_epoch(test_dl)
 
-# Calculate % of test set where there are collisions
-test_coll = count_collisions_continuous(model, test_dl, radius=0.05, buffer = 0, n_eval=200)
-#test_coll = count_collisions(model, test_dl)
+if COUNT_COL:
+    # Calculate % of test set where there are collisions
+    #test_coll = count_collisions_continuous(model, test_dl, radius=0.05, buffer = 0.01)
+    test_coll = count_collisions(model, test_dl, radius)
 
-print(f"Test MSE: {test_mse:.6f}")
-print(f"Test collision rate: {test_coll * 100:.2f}%")
+    print(f"Test MSE: {test_mse:.6f}")
+    print(f"Test collision rate: {test_coll * 100:.2f}%")
 
-# Plot multiple test samples
-plot_many_samples(model, test_ds, indices=[0,1,2], title_prefix="test")
+if PLOT_TEST:
+    # Plot multiple test samples
+    plot_many_samples(model, test_ds, indices=[0], title_prefix="test")
 
 # Plot user input instead of test set
 if SELF_EVAL:
-    # Create test input with 10 obstacles
-    test_input = np.array([[
-        [0.0, 0.0, 0.0],  # start
-        [1.0, 1.0, 1.0],  # end
-        [0.3, 0.3, 0.35], # 10 obstacles
-        [0.45, 0.4, 0.4],
-        [0.5, 0.5, 0.55],
-        [0.6, 0.64, 0.6],
-        [0.7, 0.72, 0.7],
-        [0.25, 0.35, 0.45],
-        [0.35, 0.45, 0.55],
-        [0.45, 0.55, 0.65],
-        [0.55, 0.65, 0.75],
-        [0.65, 0.75, 0.85],
-        [0.0, 0.0, 0.0]  # initial velocity
-    ]], dtype=np.float32)
+    # Get a test sample as the base
+    sample_idx = 0  # Change this to try different samples
+    X_sample, Y_sample = test_ds[sample_idx]
 
-    # Normalize
-    test_input_norm = (test_input - X_mean) / X_std
-    test_input_tensor = torch.from_numpy(test_input_norm).to(device)
+    # Denormalize to get actual values
+    X_mean_t = torch.from_numpy(X_mean.squeeze(0)).to(X_sample.dtype)
+    X_std_t = torch.from_numpy(X_std.squeeze(0)).to(X_sample.dtype)
+    Y_mean_t = torch.from_numpy(Y_mean.squeeze(0)).to(Y_sample.dtype)
+    Y_std_t = torch.from_numpy(Y_std.squeeze(0)).to(Y_sample.dtype)
 
-    # Get prediction
-    model.eval()
-    with torch.no_grad():
-        output_norm = model(test_input_tensor)
-        output = output_norm.cpu().numpy() * Y_std + Y_mean  # Denormalize
+    X_denorm = (X_sample * X_std_t + X_mean_t).numpy()
+    Y_denorm = (Y_sample * Y_std_t + Y_mean_t).numpy()
 
-    # Plot in separate orbiting figure
-    plot_sample_interactive_from_input(model, test_input)
+    # Modify the 2nd control point (last token in X)
+    # Original value:
+    print(f"Original 2nd control point: {X_denorm[-1]}")
+
+    # Adjust it however you want:
+    X_denorm[-1] = np.array([0.0, 0.0, 0.0])  # Set to whatever you want
+    # Or shift it:
+    # X_denorm[-1] += np.array([0.05, 0.05, 0.05])
+
+    print(f"Modified 2nd control point: {X_denorm[-1]}")
+
+    # Prepare for model (add batch dimension)
+    test_input = X_denorm[np.newaxis, :]  # (1, T_in, 3)
+    ground_truth = Y_denorm[np.newaxis, :]  # (1, T_out, 3)
+
+    # Plot with ground truth
+    plot_sample_interactive_from_input(model, test_input, ground_truth=ground_truth)

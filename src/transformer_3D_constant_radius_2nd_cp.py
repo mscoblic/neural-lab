@@ -22,16 +22,17 @@ from BeBOT import PiecewiseBernsteinPoly
 # ======================================================================================================================
 # Global definitions
 # ======================================================================================================================
-TRAIN = False        # train or load saved model
+TRAIN = True        # train or load saved model
 MODEL_PATH = "models/best_model.pth"
+COUNT_COL = False
+PLOT_TEST = False
 TIME_EVAL = False   # run timing benchmark
 SELF_EVAL = True   # user input (bottom of script)
 SWEEP_EVAL = False  # sweep values for gif
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-file_path = "../data/CA3D/CA3D_constant_radius_10k.xlsx"
+file_path = "../data/CA3D/CA3D_constant_radius_10k_debug.xlsx"
 df = pd.read_excel(file_path)
 
 # Build 4 tokens
@@ -40,11 +41,11 @@ radius = 0.1
 obstacles = []
 start    = df[["x0","y0", "z0"]].to_numpy(np.float32)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)
-control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)
+control  = df[["x2","y2", "z2"]].to_numpy(np.float32)
 for i in range(1, numObs + 1):
     obs_i = df[[f"ox{i}", f"oy{i}", f"oz{i}"]].to_numpy(np.float32)
     obstacles.append(obs_i)
-output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8","z2", "z3", "z4", "z5", "z6", "z7","z8"]
+output_cols = ["x3", "x4", "x5", "x6", "x7", "x8", "y3", "y4", "y5", "y6", "y7", "y8", "z3", "z4", "z5", "z6", "z7","z8"]
 
 # Input and Output sizes
 T_in = 3 + numObs
@@ -346,7 +347,7 @@ def time_inference_comparison(model, dataset, n_samples=100, n_warmup=10):
 def _to_np(t):
    return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
 
-# Plots SELF_EVAL in a 3D window for orbiting
+# Plotting function that allows a 3D orbit
 def plot_sample_interactive_from_input(model, test_input, radius):
     """Interactive 3D plot using Plotly from raw input array"""
     model.eval()
@@ -367,17 +368,17 @@ def plot_sample_interactive_from_input(model, test_input, radius):
 
     obstacles = test_input[0, 2:2+numObs]
 
-    cpx, cpy, cpz = test_input[0, 2 + numObs]
+    cp2x, cp2y, cp2z = test_input[0, 2 + numObs]
 
     # Build trajectory
     pred_points = output[0]  # (T_out, 3)
-    cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+    cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
 
-    control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
+    control_points_x = np.array([x0, cp2x, cp3[0], cp4[0], cp5[0],
                                  cp5[0], cp6[0], cp7[0], cp8[0], xf])
-    control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
+    control_points_y = np.array([y0, cp2y, cp3[1], cp4[1], cp5[1],
                                  cp5[1], cp6[1], cp7[1], cp8[1], yf])
-    control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
+    control_points_z = np.array([z0, cp2z, cp3[2], cp4[2], cp5[2],
                                  cp5[2], cp6[2], cp7[2], cp8[2], zf])
 
     tknots = np.array([0, 0.5, 1.0])
@@ -418,7 +419,7 @@ def plot_sample_interactive_from_input(model, test_input, radius):
 
     # Heading control point
     fig.add_trace(go.Scatter3d(
-        x=[cpx], y=[cpy], z=[cpz],
+        x=[cp2x], y=[cp2y], z=[cp2z],
         mode='markers',
         marker=dict(size=8, color='purple'),
         name='Initial Velocity'
@@ -594,98 +595,13 @@ def plot_dataset_sample(model, ds, radius, idx, save_path=None, title_prefix="te
     # denormalize
     X_denorm      = X * X_std_t + X_mean_t
     Y_true_denorm = Y_true * Y_std_t + Y_mean_t
-    Y_pred_denorm = Y_pred * Y_std_t + Y_mean_t
 
-    # recover tokens
-    x0, y0, z0 = X_denorm[0].tolist()    # start
-    xf, yf, zf = X_denorm[1].tolist()    # end
+    # Convert to input format: add batch dimension
+    test_input = X_denorm.unsqueeze(0).numpy()  # (1, T_in, 3)
+    ground_truth = Y_true_denorm.unsqueeze(0).numpy()  # (1, T_out, 3)
 
-    obstacles = X_denorm[2:2+numObs].numpy()    # obstacle
-
-    cpx, cpy, cpz = X_denorm[2+numObs].tolist()  # control
-
-    # --- Build polynomial ---
-    if plot_continuous:
-        pred_points = Y_pred_denorm.numpy()
-
-        cp2 = pred_points[0]
-        cp3 = pred_points[1]
-        cp4 = pred_points[2]
-        cp5 = pred_points[3]        # duplicate cp
-        cp6 = pred_points[4]
-        cp7 = pred_points[5]
-        cp8 = pred_points[6]
-
-        control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
-                                     cp5[0], cp6[0], cp7[0], cp8[0], xf])
-        control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
-                                     cp5[1], cp6[1], cp7[1], cp8[1], yf])
-        control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
-                                     cp5[2], cp6[2], cp7[2], cp8[2], zf])
-
-        tknots = np.array([0, 0.5, 1.0])
-        t_eval = np.linspace(0, 1, n_eval)
-
-        traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
-        traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
-        traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
-
-
-    # --- 3D scatter plot ---
-    fig = plt.figure(figsize=(7, 7))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_box_aspect([1, 1, 1])
-    ax.view_init(elev=elev, azim=azim)  # <<< set camera
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_zlim(0, 1)
-
-    if plot_continuous:
-        ax.plot(traj_x, traj_y, traj_z, 'b-', linewidth=2,
-                label='piecewise bpoly', alpha=0.7, zorder=1)
-
-    # start / end / control / obstacle
-    ax.scatter([x0], [y0], [z0], s=80, marker = 'o', label='start', depthshade=False)
-    ax.scatter([xf], [yf], [zf], s=120, marker = '*', label='end', depthshade=False)
-
-    # ground truth points
-    Yt = _to_np(Y_true_denorm)
-    ax.scatter(Yt[:, 0], Yt[:, 1], Yt[:, 2], s=36, color='black', marker='x', label='ground truth', depthshade=False)
-
-    # predicted points
-    Yp = _to_np(Y_pred_denorm)
-    ax.scatter(Yp[:, 0], Yp[:, 1], Yp[:, 2], s=28, marker='o', label='prediction', depthshade=False)
-
-    # label each predicted point
-    for i, (x, y, z) in enumerate(Yp):
-        ax.text(float(x), float(y), float(z), str(i + 1),
-                fontsize=8, ha='left', va='bottom', color='blue')
-
-    ax.scatter([cpx], [cpy], [cpz], s=80, marker='o', label='heading control point', depthshade=False)
-
-    # draw obstacle sphere (optional visualization)
-    u, v = np.mgrid[0:2 * np.pi:20j, 0:np.pi:10j]
-
-    for i, obs in enumerate(obstacles):
-        ox, oy, oz = obs
-        xs = ox + radius * np.cos(u) * np.sin(v)
-        ys = oy + radius * np.sin(u) * np.sin(v)
-        zs = oz + radius * np.cos(v)
-        ax.plot_surface(xs, ys, zs, color='red', alpha=0.3, linewidth=0)
-
-    # cosmetics
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-    ax.set_title(f"{title_prefix} sample idx={idx}")
-    ax.legend()
-    ax.grid(True)
-
-    if save_path:
-        fig.savefig(save_path, dpi=160, bbox_inches="tight")
-        plt.close(fig)
-    else:
-        plt.show()
+    # Call existing interactive plotter with ground truth
+    plot_sample_interactive_from_input(model, test_input, radius)
 
 # Visualize many samples quickly
 @torch.no_grad()
@@ -719,6 +635,7 @@ def eval_epoch(loader):
         running += loss.item() * X.size(0)
     return running / len(loader.dataset)
 
+# Count number of collision with control points
 @torch.no_grad()
 def count_collisions(model, loader, radius):
     model.eval()
@@ -759,6 +676,7 @@ def count_collisions(model, loader, radius):
 
     return collided / max(total, 1)
 
+# Count number of collisions along bernstein path
 @torch.no_grad()
 def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=100):
     model.eval()
@@ -1004,37 +922,49 @@ print("\n=== Test Metrics ===")
 # Calculate average MSE on all test samples
 test_mse = eval_epoch(test_dl)
 
-# Calculate % of test set where there are collisions
-test_coll = count_collisions_continuous(model, test_dl, radius=radius, buffer = 0)
-#test_coll = count_collisions(model, test_dl,radius)
+if COUNT_COL:
+    # Calculate % of test set where there are collisions
+    test_coll = count_collisions_continuous(model, test_dl, radius=radius, buffer = 0)
+    #test_coll = count_collisions(model, test_dl,radius)
 
-print(f"Test MSE: {test_mse:.6f}")
-print(f"Test collision rate: {test_coll * 100:.2f}%")
+    print(f"Test MSE: {test_mse:.6f}")
+    print(f"Test collision rate: {test_coll * 100:.2f}%")
 
-# Plot multiple test samples
-plot_many_samples(model, test_ds, radius, indices=[0,1,2], title_prefix="test")
+if PLOT_TEST:
+    # Plot multiple test samples
+    plot_many_samples(model, test_ds, radius, indices=[0], title_prefix="test")
 
 # Plot user input instead of test set
 if SELF_EVAL:
-    # Create test input with 10 obstacles
-    test_input = np.array([[
-        [0.0, 0.0, 0.0],  # start
-        [1.0, 1.0, 1.0],  # end
-        [0.3, 0.3, 0.35], # obstacle
-        [0.0, 0.0, 0.0]  # initial velocity
-    ]], dtype=np.float32)
+    # Get a test sample as the base
+    sample_idx = 0  # Change this to try different samples
+    X_sample, Y_sample = test_ds[sample_idx]
 
-    # Normalize
-    test_input_norm = (test_input - X_mean) / X_std
-    test_input_tensor = torch.from_numpy(test_input_norm).to(device)
+    # Denormalize to get actual values
+    X_mean_t = torch.from_numpy(X_mean.squeeze(0)).to(X_sample.dtype)
+    X_std_t = torch.from_numpy(X_std.squeeze(0)).to(X_sample.dtype)
+    Y_mean_t = torch.from_numpy(Y_mean.squeeze(0)).to(Y_sample.dtype)
+    Y_std_t = torch.from_numpy(Y_std.squeeze(0)).to(Y_sample.dtype)
 
-    # Get prediction
-    model.eval()
-    with torch.no_grad():
-        output_norm = model(test_input_tensor)
-        output = output_norm.cpu().numpy() * Y_std + Y_mean  # Denormalize
+    X_denorm = (X_sample * X_std_t + X_mean_t).numpy()
+    Y_denorm = (Y_sample * Y_std_t + Y_mean_t).numpy()
 
-    # Plot in separate orbiting figure
+    # Modify the 2nd control point (last token in X)
+    # Original value:
+    print(f"Original 2nd control point: {X_denorm[-1]}")
+
+    # Adjust it however you want:
+    X_denorm[-1] = np.array([0.0, 0.0, 0.0])  # Set to whatever you want
+    # Or shift it:
+    # X_denorm[-1] += np.array([0.05, 0.05, 0.05])
+
+    print(f"Modified 2nd control point: {X_denorm[-1]}")
+
+    # Prepare for model (add batch dimension)
+    test_input = X_denorm[np.newaxis, :]  # (1, T_in, 3)
+    ground_truth = Y_denorm[np.newaxis, :]  # (1, T_out, 3)
+
+    # Plot with ground truth
     plot_sample_interactive_from_input(model, test_input, radius)
 
 if SWEEP_EVAL:

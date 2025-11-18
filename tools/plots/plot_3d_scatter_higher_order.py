@@ -497,14 +497,21 @@ def main():
         pred_points = pred_3xT.T.numpy()
         gt_points = gt_3xT.T.numpy()
 
-        cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+        # Unpack 17 predicted control points (cp2 through cp18)
+        cp2, cp3, cp4, cp5, cp6, cp7, cp8, cp9, cp10, cp11, cp12, cp13, cp14, cp15, cp16, cp17, cp18 = pred_points
 
-        control_points_x = np.array([sx, cp2[0], cp3[0], cp4[0], cp5[0],
-                                     cp5[0], cp6[0], cp7[0], cp8[0], ex])
-        control_points_y = np.array([sy, cp2[1], cp3[1], cp4[1], cp5[1],
-                                     cp5[1], cp6[1], cp7[1], cp8[1], ey])
-        control_points_z = np.array([sz, cp2[2], cp3[2], cp4[2], cp5[2],
-                                     cp5[2], cp6[2], cp7[2], cp8[2], ez])
+        # Build control points: 10 per segment with cp10 duplicated
+        # Segment 1: [sx, cp2, cp3, cp4, cp5, cp6, cp7, cp8, cp9, cp10]
+        # Segment 2: [cp10, cp11, cp12, cp13, cp14, cp15, cp16, cp17, cp18, ex]
+        control_points_x = np.array([sx, cp2[0], cp3[0], cp4[0], cp5[0], cp6[0], cp7[0], cp8[0], cp9[0], cp10[0],
+                                     cp10[0], cp11[0], cp12[0], cp13[0], cp14[0], cp15[0], cp16[0], cp17[0], cp18[0],
+                                     ex])
+        control_points_y = np.array([sy, cp2[1], cp3[1], cp4[1], cp5[1], cp6[1], cp7[1], cp8[1], cp9[1], cp10[1],
+                                     cp10[1], cp11[1], cp12[1], cp13[1], cp14[1], cp15[1], cp16[1], cp17[1], cp18[1],
+                                     ey])
+        control_points_z = np.array([sz, cp2[2], cp3[2], cp4[2], cp5[2], cp6[2], cp7[2], cp8[2], cp9[2], cp10[2],
+                                     cp10[2], cp11[2], cp12[2], cp13[2], cp14[2], cp15[2], cp16[2], cp17[2], cp18[2],
+                                     ez])
 
         tknots = np.array([0, 0.5, 1.0])
         t_eval = np.linspace(0, 1, 100)

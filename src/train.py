@@ -20,7 +20,8 @@ import json
 import torch
 import yaml
 import torch.nn as nn
-import matplotlib.pyplot as plt  # NEW
+import matplotlib.pyplot as plt
+import numpy as np  # NEW
 # from torch.optim.lr_scheduler import ExponentialLR   # (unused)
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -51,6 +52,98 @@ def build_optimizer(model: nn.Module, opt_name: str, lr: float, weight_decay: fl
     if name == "adam":
         return Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     raise ValueError(f"Unknown optimizer: {opt_name}")
+
+
+@torch.no_grad()
+def count_collisions_continuous(model, loader, device, x_norm, y_norm, K: int, T: int, radius: float = 0.1,
+                                n_eval: int = 100):
+    """
+    Count collisions by evaluating continuous Bernstein polynomial trajectories
+
+    Args:
+        model: trained model
+        loader: DataLoader for the dataset
+        device: computation device
+        x_norm: input normalizer
+        y_norm: output normalizer
+        K: number of dimensions (should be 3)
+        T: number of output control points (should be 7)
+        radius: obstacle radius
+        n_eval: number of points to evaluate along trajectory
+
+    Returns:
+        float: collision rate (0.0 to 1.0)
+    """
+    import sys
+    from pathlib import Path
+
+    # Import BeBOT
+    tools_dir = Path(__file__).resolve().parent.parent / 'tools' / 'extra'
+    if str(tools_dir) not in sys.path:
+        sys.path.append(str(tools_dir))
+    from BeBOT import PiecewiseBernsteinPoly
+
+    model.eval()
+
+    total = 0
+    collided = 0
+
+    for x, _ in loader:
+        x = x.to(device)
+
+        # Get predictions and denormalize
+        with torch.no_grad():
+            y_pred_norm = model(x)
+        y_pred = y_norm.inverse(y_pred_norm).cpu()
+
+        # Denormalize inputs
+        x_denorm = x_norm.inverse(x).cpu()
+
+        # Process each trajectory in batch
+        for i in range(x.size(0)):
+            # Extract start/end from inputs
+            sx, sy, sz = x_denorm[i, 0].item(), x_denorm[i, 1].item(), x_denorm[i, 2].item()
+            ex, ey, ez = x_denorm[i, 3].item(), x_denorm[i, 4].item(), x_denorm[i, 5].item()
+
+            # Extract obstacle center and radius
+            ox, oy, oz = x_denorm[i, 6].item(), x_denorm[i, 7].item(), x_denorm[i, 8].item()
+            r = 0.1
+
+            # Get predicted control points
+            pred_3xT = y_pred[i].view(K, T)  # (3, 7)
+            pred_points = pred_3xT.T.numpy()  # (7, 3)
+
+            # Build Bernstein polynomial trajectory
+            cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+
+            control_points_x = np.array([sx, cp2[0], cp3[0], cp4[0], cp5[0],
+                                         cp5[0], cp6[0], cp7[0], cp8[0], ex])
+            control_points_y = np.array([sy, cp2[1], cp3[1], cp4[1], cp5[1],
+                                         cp5[1], cp6[1], cp7[1], cp8[1], ey])
+            control_points_z = np.array([sz, cp2[2], cp3[2], cp4[2], cp5[2],
+                                         cp5[2], cp6[2], cp7[2], cp8[2], ez])
+
+            # Evaluate continuous trajectory
+            tknots = np.array([0, 0.5, 1.0])
+            t_eval = np.linspace(0, 1, n_eval)
+
+            traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
+            traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
+            traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
+
+            # Stack into (n_eval, 3)
+            trajectory = np.column_stack([traj_x, traj_y, traj_z])
+
+            # Check collision
+            obstacle_center = np.array([ox, oy, oz])
+            distances = np.linalg.norm(trajectory - obstacle_center, axis=1)
+
+            if np.any(distances < r):
+                collided += 1
+
+            total += 1
+
+    return collided / max(total, 1)
 
 def build_scheduler(optimizer, sched_cfg: dict | None, total_epochs: int):
     """
@@ -126,7 +219,7 @@ def eval_one_epoch(model, loader, loss_fn, device, K: int):
     return (total / n, *[t / n for t in axis_totals])
 
 
-# NEW: Plotting function
+# MODIFIED: Plotting function
 def plot_training_curves(train_losses, val_losses, save_path, best_epoch=None):
     """
     Plot training and validation loss curves.
@@ -137,25 +230,19 @@ def plot_training_curves(train_losses, val_losses, save_path, best_epoch=None):
         save_path: Path to save the plot
         best_epoch: Epoch number with best validation loss (for marking)
     """
-    plt.figure(figsize=(10, 6))
-    epochs = range(1, len(train_losses) + 1)
+    plt.figure(figsize=(6, 4))
+    xs = np.arange(1, len(val_losses) + 1)
 
-    plt.plot(epochs, train_losses, 'b-', label='Train MSE', linewidth=2)
-    plt.plot(epochs, val_losses, 'r-', label='Val MSE', linewidth=2)
+    plt.plot(xs, val_losses, linestyle='-', linewidth=2, label='Val MSE')
+    plt.plot(np.arange(1, len(train_losses) + 1), train_losses, linestyle='-', linewidth=2, label='Train MSE')
 
-    # Mark best epoch if provided
-    if best_epoch is not None and best_epoch <= len(val_losses):
-        plt.axvline(x=best_epoch, color='g', linestyle='--',
-                    label=f'Best epoch ({best_epoch})', alpha=0.7)
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE')
+    plt.title('MSE over epochs')
+    plt.grid(True)
+    plt.legend()
 
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('MSE', fontsize=12)
-    plt.title('Training and Validation Loss', fontsize=14, fontweight='bold')
-    plt.legend(fontsize=10)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(save_path, dpi=160, bbox_inches='tight')
     plt.close()
     print(f"[PLOT] Saved training curve to {save_path}")
 
@@ -339,7 +426,7 @@ def main():
     epochs_since = 0
     best_ckpt = run_dir / "model_best.pt"
 
-    # NEW: Lists to store losses for plotting
+    # Lists to store losses for plotting
     train_losses = []
     val_losses = []
 
@@ -347,7 +434,7 @@ def main():
         train_mse = train_one_epoch(model, train_loader, loss_fn, optimizer, device, grad_clip=grad_clip)
         val_mse, *axis_mse = eval_one_epoch(model, val_loader, loss_fn, device, K)
 
-        # NEW: Store losses
+        # Store losses
         train_losses.append(train_mse)
         val_losses.append(val_mse)
 
@@ -385,30 +472,74 @@ def main():
 
     csv_logger.close()
 
-    # NEW: Generate and save plot
+    # Generate and save plot
     plot_training_curves(train_losses, val_losses, run_dir / "training_curve.png", best_epoch=best_epoch)
 
+    # ---- Final test evaluation on held-out set ----
     # ---- Final test evaluation on held-out set ----
     if test_loader is not None:
         best = torch.load(best_ckpt, map_location=device)
         model.load_state_dict(best["state_dict"])
         test_mse, *axis_mse = eval_one_epoch(model, test_loader, loss_fn, device, K)
 
+        # Calculate collision rate
+        print("\n[INFO] Calculating collision rate...")
+
+        # Import BeBOT at the top level if not already done
+        import sys
+        tools_dir = Path(__file__).resolve().parent.parent / 'tools' / 'extra'
+        if str(tools_dir) not in sys.path:
+            sys.path.append(str(tools_dir))
+        from BeBOT import PiecewiseBernsteinPoly
+        from src.data import Normalizer, NormStats
+
+        # Reconstruct normalizers from norm_state
+        x_state = norm_state["inputs"]
+        y_state = norm_state["outputs"]
+
+        x_normalizer = Normalizer(x_state["mode"])
+        y_normalizer = Normalizer(y_state["mode"])
+
+        # Restore stats
+        if x_state["stats"] is not None:
+            x_normalizer.fitted = True
+            x_normalizer.stats = NormStats(
+                mean=torch.tensor(x_state["stats"]["mean"], dtype=torch.float32),
+                std=torch.tensor(x_state["stats"]["std"], dtype=torch.float32)
+            )
+
+        if y_state["stats"] is not None:
+            y_normalizer.fitted = True
+            y_normalizer.stats = NormStats(
+                mean=torch.tensor(y_state["stats"]["mean"], dtype=torch.float32),
+                std=torch.tensor(y_state["stats"]["std"], dtype=torch.float32)
+            )
+
+        test_collision_rate = count_collisions_continuous(
+            model, test_loader, device,
+            x_normalizer,
+            y_normalizer,
+            K, raw.T, radius=0.1, n_eval=100
+        )
+
         if K == 2:
-            payload = {"test_mse": test_mse, "test_mse_x": axis_mse[0], "test_mse_y": axis_mse[1]}
+            payload = {"test_mse": test_mse, "test_mse_x": axis_mse[0], "test_mse_y": axis_mse[1],
+                       "test_collision_rate": test_collision_rate}
             print(f"[TEST] MSE={test_mse:.6f} (x={axis_mse[0]:.6f}, y={axis_mse[1]:.6f})")
         elif K == 3:
             payload = {"test_mse": test_mse, "test_mse_x": axis_mse[0], "test_mse_y": axis_mse[1],
-                       "test_mse_z": axis_mse[2]}
-            print(f"[TEST] MSE={test_mse:.6f} (x={axis_mse[0]:.6f}, y={axis_mse[1]:.6f}, z={axis_mse[2]:.6f})")
+                       "test_mse_z": axis_mse[2], "test_collision_rate": test_collision_rate}
+            print(f"Test MSE: {test_mse:.6f}")
         else:
-            payload = {"test_mse": test_mse} | {f"test_mse_axis{i + 1}": v for i, v in enumerate(axis_mse)}
+            payload = {"test_mse": test_mse, "test_collision_rate": test_collision_rate} | {f"test_mse_axis{i + 1}": v
+                                                                                            for i, v in
+                                                                                            enumerate(axis_mse)}
             parts = ", ".join(f"a{i + 1}={v:.6f}" for i, v in enumerate(axis_mse))
             print(f"[TEST] MSE={test_mse:.6f} ({parts})")
 
-        save_json(payload, run_dir / "test_metrics.json")
+        print(f"Test collision rate: {test_collision_rate * 100:.2f}%")
 
-    print(f"[DONE] Best val MSE={best_val:.6f} @ epoch {best_epoch}. Checkpoint: {best_ckpt}")
+        save_json(payload, run_dir / "test_metrics.json")
 
 
 if __name__ == "__main__":

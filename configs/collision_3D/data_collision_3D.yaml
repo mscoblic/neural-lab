@@ -11,7 +11,7 @@ schema:
   header: 0
 
   # inputs:
-  input_cols: [x0, y0, z0, xf, yf, zf, ox, oy, oz, vxinit, vyinit, vzinit]
+  input_cols: [x0, y0, z0, xf, yf, zf, ox1, oy1, oz1, vxinit, vyinit, vzinit]
 
   # outputs: x trajectory, y trajectory
   output_slices:

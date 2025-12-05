@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import torch.optim as optim
 import math
 import numpy as np
@@ -13,6 +14,7 @@ import os
 import sys
 from pathlib import Path
 import plotly.graph_objects as go
+import json
 
 # Import BeBOT
 project_root = Path(__file__).resolve().parent.parent
@@ -22,49 +24,63 @@ from BeBOT import PiecewiseBernsteinPoly
 # ======================================================================================================================
 # Global definitions
 # ======================================================================================================================
-TRAIN = False        # train or load saved model
+TRAIN = True        # train or load saved model
 MODEL_PATH = "models/best_model.pth"
-COUNT_COL = False
-PLOT_TEST = False
+COUNT_COL = True
+PLOT_TEST = True
 TIME_EVAL = False   # run timing benchmark
-SELF_EVAL = True   # user input (bottom of script)
-SWEEP_EVAL = False  # sweep values for gif
+SELF_EVAL = False   # user input (bottom of script)
+LOAD_FROM_EXCEL = False
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-file_path = "../data/CA3D/CA3D_constant_radius_10k_debug.xlsx"
-df = pd.read_excel(file_path)
+numObs = 15
+radius = 0.05
+file_path = "../data/CA3D/CA3D_15_obstacles_300k.xlsx"
+df_pickle_path = "data/mult_obs_cp.pkl"
+
+if LOAD_FROM_EXCEL:
+    print("Loading from Excel (this will take a while)...")
+    df = pd.read_excel(file_path)
+    print("Saving dataframe to pickle for future use...")
+    df.to_pickle(df_pickle_path)
+    print(f"✓ Saved to {df_pickle_path}")
+else:
+    print("Loading from pickle (fast)...")
+    df = pd.read_pickle(df_pickle_path)
+    print(f"✓ Loaded {len(df)} rows")
 
 # Build 4 tokens
-numObs = 1
-radius = 0.1
 obstacles = []
 start    = df[["x0","y0", "z0"]].to_numpy(np.float32)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)
-control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)
 for i in range(1, numObs + 1):
     obs_i = df[[f"ox{i}", f"oy{i}", f"oz{i}"]].to_numpy(np.float32)
     obstacles.append(obs_i)
-output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8","z2", "z3", "z4", "z5", "z6", "z7","z8"]
+output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8", "z2","z3", "z4", "z5", "z6", "z7","z8"]
 
 # Input and Output sizes
-T_in = 3 + numObs
+T_in = 2 + numObs
 T_out = len(output_cols) // 3
 
 # Hyperparameters
 EPOCHS = 100
 patience_counter = 0
-patience_limit = 10
+patience_limit = 75
 input_dim = 3
-d_model = 64
-num_heads = 4
-num_layers = 2
-d_ff = 128
+d_model = 28
+num_heads = 2
+num_layers = 1
+d_ff = 64
 dropout = 0.2
 output_dim = 3
 max_seq_length = T_in
 batch_size = 64
 lr = 1e-3
+weight_decay = 0.05
+warmup_epochs = 10
+min_lr = 1e-6
 
 # ======================================================================================================================
 # Class definitions
@@ -217,16 +233,20 @@ class TransformerEncoder(nn.Module):
         return self.head(h) if self.head is not None else h
 
 class FlattenMLPHead(nn.Module):
-    def __init__(self, seq_len, d_model, hidden=256, t_out=7, out_dim=2):
+    def __init__(self, seq_len, d_model, hidden=128, t_out=7, out_dim=3, dropout=0.3):
         super().__init__()
         self.seq_len = seq_len
         self.d_model = d_model
-        self.t_out   = t_out
+        self.t_out = t_out
         self.out_dim = out_dim
         self.net = nn.Sequential(
             nn.Linear(seq_len * d_model, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, t_out * out_dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),  # Add intermediate layer
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, t_out * out_dim)
         )
 
     def forward(self, h):  # h: (B, seq_len, d_model)
@@ -250,9 +270,34 @@ class TrajDataset(Dataset):
     def __len__(self):  return self.X.shape[0]
     def __getitem__(self, i):  return self.X[i], self.Y[i]
 
+class CosineAnnealingWarmupScheduler:
+    def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6, max_lr=1e-3):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+        self.current_epoch = 0
+
+    def step(self):
+        if self.current_epoch < self.warmup_epochs:
+            # Linear warmup
+            lr = self.max_lr * (self.current_epoch / self.warmup_epochs)
+        else:
+            # Cosine annealing
+            progress = (self.current_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            lr = self.min_lr + (self.max_lr - self.min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+        self.current_epoch += 1
+        return lr
+
 # ======================================================================================================================
 # Function definitions
 # ======================================================================================================================
+
 # Calculates inference time in forward pass and full pipeline
 @torch.no_grad()
 def time_inference_comparison(model, dataset, n_samples=100, n_warmup=10):
@@ -347,9 +392,9 @@ def time_inference_comparison(model, dataset, n_samples=100, n_warmup=10):
 def _to_np(t):
    return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
 
-# Plotting function that allows a 3D orbit
-def plot_sample_interactive_from_input(model, test_input, radius):
-    """Interactive 3D plot using Plotly from raw input array"""
+# Plots SELF_EVAL in a 3D window for orbiting
+def plot_sample_interactive_from_input(model, test_input, ground_truth=None):
+    """Interactive 3D plot using Plotly from raw input array with optional ground truth"""
     model.eval()
     device = next(model.parameters()).device
 
@@ -365,12 +410,10 @@ def plot_sample_interactive_from_input(model, test_input, radius):
     # Extract points from test_input (already denormalized)
     x0, y0, z0 = test_input[0, 0]
     xf, yf, zf = test_input[0, 1]
-
     obstacles = test_input[0, 2:2+numObs]
+    r = 0.05  # radius
 
-    cpx, cpy, cpz = test_input[0, 2 + numObs]
-
-    # Build trajectory
+    # Build predicted trajectory
     pred_points = output[0]  # (T_out, 3)
     cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
 
@@ -378,7 +421,7 @@ def plot_sample_interactive_from_input(model, test_input, radius):
                                  cp5[0], cp6[0], cp7[0], cp8[0], xf])
     control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
                                  cp5[1], cp6[1], cp7[1], cp8[1], yf])
-    control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
+    control_points_z = np.array([z0, cp2[2],cp3[2], cp4[2], cp5[2],
                                  cp5[2], cp6[2], cp7[2], cp8[2], zf])
 
     tknots = np.array([0, 0.5, 1.0])
@@ -391,23 +434,55 @@ def plot_sample_interactive_from_input(model, test_input, radius):
     # Create figure
     fig = go.Figure()
 
-    # Trajectory
+    # Predicted Trajectory
     fig.add_trace(go.Scatter3d(
         x=traj_x, y=traj_y, z=traj_z,
         mode='lines',
         line=dict(color='blue', width=4),
-        name='Trajectory'
+        name='Predicted Trajectory'
     ))
 
-    # Control points
+    # Predicted Control points
     fig.add_trace(go.Scatter3d(
         x=pred_points[:, 0], y=pred_points[:, 1], z=pred_points[:, 2],
         mode='markers+text',
         marker=dict(size=6, color='green'),
         text=[str(i + 1) for i in range(len(pred_points))],
         textposition='top center',
-        name='Predictions'
+        name='Predicted CPs'
     ))
+
+    # Ground truth trajectory (if provided)
+    if ground_truth is not None:
+        gt_points = ground_truth[0]  # (T_out, 3)
+        gt_cp2, gt_cp3, gt_cp4, gt_cp5, gt_cp6, gt_cp7, gt_cp8 = gt_points
+
+        gt_control_points_x = np.array([x0, gt_cp2[0],gt_cp3[0], gt_cp4[0], gt_cp5[0],
+                                        gt_cp5[0], gt_cp6[0], gt_cp7[0], gt_cp8[0], xf])
+        gt_control_points_y = np.array([y0, gt_cp2[1], gt_cp3[1], gt_cp4[1], gt_cp5[1],
+                                        gt_cp5[1],gt_cp6[1], gt_cp7[1], gt_cp8[1], yf])
+        gt_control_points_z = np.array([z0, gt_cp2[2],gt_cp3[2], gt_cp4[2], gt_cp5[2],
+                                        gt_cp5[2], gt_cp6[2], gt_cp7[2], gt_cp8[2], zf])
+
+        gt_traj_x = PiecewiseBernsteinPoly(gt_control_points_x, tknots, t_eval)[0, :]
+        gt_traj_y = PiecewiseBernsteinPoly(gt_control_points_y, tknots, t_eval)[0, :]
+        gt_traj_z = PiecewiseBernsteinPoly(gt_control_points_z, tknots, t_eval)[0, :]
+
+        # Ground truth trajectory line
+        fig.add_trace(go.Scatter3d(
+            x=gt_traj_x, y=gt_traj_y, z=gt_traj_z,
+            mode='lines',
+            line=dict(color='red', width=4, dash='dash'),
+            name='Ground Truth Trajectory'
+        ))
+
+        # Ground truth control points
+        fig.add_trace(go.Scatter3d(
+            x=gt_points[:, 0], y=gt_points[:, 1], z=gt_points[:, 2],
+            mode='markers',
+            marker=dict(size=6, color='red', symbol='x'),
+            name='Ground Truth CPs'
+        ))
 
     # Start/End
     fig.add_trace(go.Scatter3d(
@@ -417,21 +492,13 @@ def plot_sample_interactive_from_input(model, test_input, radius):
         name='Start/End'
     ))
 
-    # Heading control point
-    fig.add_trace(go.Scatter3d(
-        x=[cpx], y=[cpy], z=[cpz],
-        mode='markers',
-        marker=dict(size=8, color='purple'),
-        name='Initial Velocity'
-    ))
-
     # Obstacle sphere
     u, v = np.mgrid[0:2 * np.pi:20j, 0:np.pi:10j]
     for i, obs in enumerate(obstacles):
         ox, oy, oz = obs
-        xs = ox + radius * np.cos(u) * np.sin(v)
-        ys = oy + radius * np.sin(u) * np.sin(v)
-        zs = oz + radius * np.cos(v)
+        xs = ox + r * np.cos(u) * np.sin(v)
+        ys = oy + r * np.sin(u) * np.sin(v)
+        zs = oz + r * np.cos(v)
 
         fig.add_trace(go.Surface(
             x=xs, y=ys, z=zs,
@@ -441,6 +508,7 @@ def plot_sample_interactive_from_input(model, test_input, radius):
             name=f'Obstacle {i+1}'
         ))
 
+    title_str = 'Predicted vs Ground Truth' if ground_truth is not None else 'Predicted Trajectory'
     fig.update_layout(
         scene=dict(
             aspectmode='cube',
@@ -453,147 +521,30 @@ def plot_sample_interactive_from_input(model, test_input, radius):
                 up=dict(x=0, y=0, z=1),
             )
         ),
-        title=f'Center Obstacle Test - 0.699'
+        title=title_str
     )
     fig.write_image("my_trajectory.png")
     fig.show()  # Opens in browser with full interactivity!
 
-# Sweeping for gif
-def plot_sweep_interactive_from_input(model, test_input, *,
-                                       save_path=None, title=None, show=False):
-
-    # Normalize input
-    test_input_norm = (test_input - X_mean) / X_std
-    test_input_tensor = torch.from_numpy(test_input_norm).to(
-        next(model.parameters()).device
-    )
-
-    # Forward pass
-    with torch.no_grad():
-        output_norm = model(test_input_tensor)
-
-    # Denormalize
-    output = output_norm.cpu().numpy() * Y_std + Y_mean
-
-    # Extract tokens
-    x0, y0, z0 = test_input[0, 0]
-    xf, yf, zf = test_input[0, 1]
-    ox, oy, oz = test_input[0, 2]
-    cpx, cpy, cpz = test_input[0, 3]
-
-    # Build CP trajectory
-    pred_points = output[0]
-    cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
-
-    control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
-                                 cp5[0], cp6[0], cp7[0], cp8[0], xf])
-    control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
-                                 cp5[1], cp6[1], cp7[1], cp8[1], yf])
-    control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
-                                 cp5[2], cp6[2], cp7[2], cp8[2], zf])
-
-    tknots = np.array([0, 0.5, 1.0])
-    t_eval = np.linspace(0, 1, 50)
-
-    traj_x = PiecewiseBernsteinPoly(control_points_x, tknots, t_eval)[0, :]
-    traj_y = PiecewiseBernsteinPoly(control_points_y, tknots, t_eval)[0, :]
-    traj_z = PiecewiseBernsteinPoly(control_points_z, tknots, t_eval)[0, :]
-
-    # Create Plotly figure
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter3d(
-        x=traj_x, y=traj_y, z=traj_z,
-        mode='lines', line=dict(color='blue', width=4),
-        name='Trajectory'
-    ))
-
-    fig.add_trace(go.Scatter3d(
-        x=pred_points[:, 0], y=pred_points[:, 1], z=pred_points[:, 2],
-        mode='markers+text',
-        marker=dict(size=6, color='green'),
-        text=[str(i + 1) for i in range(len(pred_points))],
-        textposition='top center',
-        name='Predictions'
-    ))
-
-    fig.add_trace(go.Scatter3d(
-        x=[x0, xf], y=[y0, yf], z=[z0, zf],
-        mode='markers',
-        marker=dict(size=10, color=['green', 'orange'], symbol='diamond'),
-        name='Start/End'
-    ))
-
-    fig.add_trace(go.Scatter3d(
-        x=[cpx], y=[cpy], z=[cpz],
-        mode='markers',
-        marker=dict(size=8, color='purple'),
-        name='Initial Velocity'
-    ))
-
-    # Obstacle sphere
-    u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
-    xs = ox + radius * np.cos(u) * np.sin(v)
-    ys = oy + radius * np.sin(u) * np.sin(v)
-    zs = oz + radius * np.cos(v)
-
-    fig.add_trace(go.Surface(
-        x=xs, y=ys, z=zs,
-        opacity=0.7,
-        colorscale='Reds',
-        showscale=False,
-        name='Obstacle'
-    ))
-
-    # Layout
-    fig.update_layout(
-        scene=dict(
-            aspectmode='cube',
-            xaxis=dict(range=[0, 1], title='X'),
-            yaxis=dict(range=[0, 1], title='Y'),
-            zaxis=dict(range=[0, 1], title='Z'),
-            camera=dict(
-                eye=dict(x=1.6, y=-1.3, z=1.2),
-                center=dict(x=0, y=0, z=0),
-                up=dict(x=0, y=0, z=1),
-            )
-        ),
-        title=title or "Plot"
-    )
-
-    # Save
-    if save_path is not None:
-        print(f"[plot] Saving PNG → {save_path}")
-        fig.write_image(save_path, scale=2)
-
-    # Show
-    if show:
-        print("[plot] Displaying figure in browser…")
-
-    if show:
-        fig.show()
-
-    return fig
-
 # Plots a single test sample
 @torch.no_grad()
-def plot_dataset_sample(model, ds, radius, idx, save_path=None, title_prefix="test",
-                        elev=45, azim=-70, n_eval=50, plot_continuous=True):
+def plot_dataset_sample(model, ds, idx, save_path=None, title_prefix="test"):
+    """Plot dataset sample using interactive plotter"""
     model.eval()
-    device = next(model.parameters()).device        # GPU or CPU
 
     # fetch one sample (normalized tensors)
     X, Y_true = ds[idx]  # X: (T_in,3), Y_true: (T_out,3)
-    Y_pred = model(X.unsqueeze(0).to(device))[0].cpu()  # (T_out,3)
 
     # prepare stats
     X_mean_t = torch.from_numpy(X_mean.squeeze(0)).to(X.dtype)
-    X_std_t  = torch.from_numpy(X_std.squeeze(0)).to(X.dtype)
-    Y_mean_t = torch.from_numpy(Y_mean.squeeze(0)).to(Y_pred.dtype)
-    Y_std_t  = torch.from_numpy(Y_std.squeeze(0)).to(Y_pred.dtype)
+    X_std_t = torch.from_numpy(X_std.squeeze(0)).to(X.dtype)
+    Y_mean_t = torch.from_numpy(Y_mean.squeeze(0)).to(Y_true.dtype)
+    Y_std_t = torch.from_numpy(Y_std.squeeze(0)).to(Y_true.dtype)
 
-    # denormalize
-    X_denorm      = X * X_std_t + X_mean_t
+    # denormalize X to get raw input
+    X_denorm = X * X_std_t + X_mean_t
+
+    # denormalize Y_true to get ground truth
     Y_true_denorm = Y_true * Y_std_t + Y_mean_t
 
     # Convert to input format: add batch dimension
@@ -601,25 +552,62 @@ def plot_dataset_sample(model, ds, radius, idx, save_path=None, title_prefix="te
     ground_truth = Y_true_denorm.unsqueeze(0).numpy()  # (1, T_out, 3)
 
     # Call existing interactive plotter with ground truth
-    plot_sample_interactive_from_input(model, test_input, radius)
+    plot_sample_interactive_from_input(model, test_input, ground_truth=ground_truth)
 
 # Visualize many samples quickly
 @torch.no_grad()
-def plot_many_samples(model, ds, radius, indices, title_prefix="test"):
+def plot_many_samples(model, ds, indices, title_prefix="test"):
     """Convenience: plot several dataset samples by index."""
     for j, idx in enumerate(indices):
-        plot_dataset_sample(model, ds, radius, idx, title_prefix=title_prefix)
+        plot_dataset_sample(model, ds, idx, title_prefix=title_prefix)
+
+def plot_lr_schedule(lr_history, save_path="figs/lr_schedule.png"):
+    """
+    Visualize learning rate schedule over training
+
+    Args:
+        lr_history: List of learning rates from each epoch
+        save_path: Path to save the figure
+    """
+    if len(lr_history) == 0:
+        print("Warning: No LR history to plot")
+        return
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(lr_history, linewidth=2, color='blue')
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Learning Rate', fontsize=12)
+    plt.title('Learning Rate Schedule (Warmup + Cosine Annealing)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.yscale('log')
+
+    # Add annotations for warmup phase
+    if len(lr_history) > warmup_epochs:
+        plt.axvline(x=warmup_epochs, color='red', linestyle='--',
+                    alpha=0.5, label=f'Warmup complete (epoch {warmup_epochs})')
+        plt.legend()
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=160, bbox_inches="tight")
+    plt.close()
+    print(f"Saved LR schedule plot to {save_path}")
 
 def train_one_epoch():
     model.train()
     running = 0.0
+
     for X, Y in train_dl:
-        X, Y = X.to(device), Y.to(device)         # X: (B,T,3), Y: (B,T,2)
+        X, Y = X.to(device), Y.to(device)
         optimizer.zero_grad()
-        Y_hat = model(X)                           # (B,T,2)
-        loss = criterion(Y_hat, Y)
+
+        Y_hat = model(X)
+
+        loss=criterion(Y_hat, Y)
+
         loss.backward()
         optimizer.step()
+
         running += loss.item() * X.size(0)
 
     return running / len(train_dl.dataset)
@@ -635,7 +623,6 @@ def eval_epoch(loader):
         running += loss.item() * X.size(0)
     return running / len(loader.dataset)
 
-# Count number of collision with control points
 @torch.no_grad()
 def count_collisions(model, loader, radius):
     model.eval()
@@ -676,7 +663,6 @@ def count_collisions(model, loader, radius):
 
     return collided / max(total, 1)
 
-# Count number of collisions along bernstein path
 @torch.no_grad()
 def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=100):
     model.eval()
@@ -713,6 +699,7 @@ def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=100):
             # Get predicted control points
             pred_points = Yp_den[i].cpu().numpy()  # (T_out, 3)
             cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+
 
             # Build control point arrays with cp5 duplicated
             control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
@@ -752,7 +739,7 @@ def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=100):
 # ======================================================================================================================
 
 # Stack into tokens
-X_np = np.stack([start, end, *obstacles, control], axis=1)
+X_np = np.stack([start, end, *obstacles], axis=1)
 Y_np = df[output_cols].to_numpy(dtype=np.float32)
 
 # Split into each dimension
@@ -760,6 +747,7 @@ N = Y_np.shape[0]
 Y_np = Y_np.reshape(N, 3, T_out).transpose(0, 2, 1)
 
 # Data processing
+N = X_np.shape[0]
 seed = 42
 rng = np.random.default_rng(seed)
 perm = rng.permutation(N)
@@ -812,29 +800,67 @@ encoder = TransformerEncoder(
 ).to(device)
 
 # Build FNN
-head = FlattenMLPHead(seq_len=T_in, d_model=d_model, hidden=256, t_out=T_out, out_dim=output_dim).to(device)
+head = FlattenMLPHead(seq_len=T_in, d_model=d_model, hidden=224, t_out=T_out, out_dim=output_dim).to(device)
 
 # Wraps both together
 model = TrajModel(encoder, head).to(device)
+
+# Check datasize and model size for overfitting
+print("\n=== Model Size to Data Size Check ===")
+total_params = sum(p.numel() for p in model.parameters())
+samples_per_param = len(train_ds) / total_params
+
+print(f"Total parameters: {total_params:,}")
+print(f"Training samples: {len(train_ds):,}")
+print(f"Current ratio: {samples_per_param:.3f} samples/parameter")
+
+print(f"\n--- Recommendations ---")
+
+# Optimal params for current dataset
+optimal_params_min = len(train_ds) // 5  # conservative (5 samples/param)
+optimal_params_max = len(train_ds) // 1  # aggressive (1 sample/param)
+print(f"For {len(train_ds):,} samples, aim for:")
+print(f"  Conservative: {optimal_params_min:,} - {optimal_params_max:,} parameters")
+
+# Optimal dataset for current model
+optimal_samples_min = total_params * 1  # aggressive (1 sample/param)
+optimal_samples_max = total_params * 5  # conservative (5 samples/param)
+print(f"\nFor {total_params:,} parameters, aim for:")
+print(f"  {optimal_samples_min:,} - {optimal_samples_max:,} samples")
+
+# Status indicator
+if samples_per_param < 0.5:
+    status = "⚠️  SEVERE OVERFITTING RISK"
+elif samples_per_param < 1.0:
+    status = "⚠️  HIGH OVERFITTING RISK"
+elif samples_per_param < 3.0:
+    status = "⚡ MODERATE - Watch for overfitting"
+else:
+    status = "✓ GOOD REGIME"
+
+print(f"\nStatus: {status}")
+print(f"{'='*60}\n")
 
 # Pick loss method
 criterion = nn.MSELoss()
 
 # Pick optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 # Scheduled LR
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+scheduler = CosineAnnealingWarmupScheduler(
     optimizer,
-    mode = 'min', # minimize metric
-    factor = 0.5, # reduce LR by half
-    patience = 3, # wait 3 epochs before reducing
+    warmup_epochs=warmup_epochs,
+    total_epochs=EPOCHS,
+    min_lr=min_lr,
+    max_lr=lr
 )
 
 # Containers for test MSE, collision rate history, training losses
 test_mse_hist = []
 coll_rate_hist = []
 train_losses = []
+lr_history = []
 
 # Track lowest test MSE
 best_test_mse = float('inf')
@@ -852,12 +878,12 @@ if TRAIN:
 
         # collision rate for this epoch
         #coll = count_collisions_continuous(model, test_dl, radius, buffer = 0)
-        coll = count_collisions(model, test_dl, radius)
-        coll_rate_hist.append(coll)
+        #coll = count_collisions(model, test_dl, radius)
+        #coll_rate_hist.append(coll)
 
         # update learning rate
-        scheduler.step(te)
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = scheduler.step()
+        lr_history.append(current_lr)
 
         # Early stopping logic
         if te < best_test_mse:      # Save the model if we did better than last time
@@ -873,7 +899,8 @@ if TRAIN:
             break
 
         # Print results
-        print(f"epoch {epoch+1:02d} | train MSE {tr:.6f} | test MSE {te:.6f} | collisions {coll:.2%} | LR {current_lr:.6f}")
+        print(f"epoch {epoch + 1:03d} | train_mse {tr:.4f} | test_mse {te:.4f} | "
+              f"LR {current_lr:.6f} | patience {patience_counter}/{patience_limit}")
 
         # Generate training figures
         os.makedirs("figs", exist_ok=True)
@@ -898,6 +925,14 @@ if TRAIN:
         plt.grid(True); plt.legend()
         plt.savefig("figs/mse_over_epochs.png", dpi=160, bbox_inches="tight")
         plt.close()
+
+    print(f"\nTraining complete. Best test MSE: {best_test_mse:.4f}")
+
+    # Visualize LR schedule
+    plot_lr_schedule(lr_history)
+
+    model.load_state_dict(torch.load("models/best_model.pth"))
+
 else:
     # Load the saved model when not training
     print(f"Loading model from {MODEL_PATH}...")
@@ -912,6 +947,34 @@ else:
     Y_std = stats['Y_std']
     print("Model and normalization stats loaded successfully")
 
+print("\n=== Loss Space Verification ===")
+
+# Get one batch
+X_batch, Y_batch = next(iter(test_dl))
+X_batch, Y_batch = X_batch.to(device), Y_batch.to(device)
+
+# Compute normalized loss (what you're seeing)
+with torch.no_grad():
+    Y_pred = model(X_batch)
+    norm_loss = criterion(Y_pred, Y_batch)
+    print(f"Normalized MSE: {norm_loss.item():.6f}")
+
+# Denormalize and compute physical loss
+Y_mean_t = torch.from_numpy(Y_mean).to(device)
+Y_std_t = torch.from_numpy(Y_std).to(device)
+
+Y_batch_phys = Y_batch * Y_std_t + Y_mean_t
+Y_pred_phys = Y_pred * Y_std_t + Y_mean_t
+
+phys_loss = criterion(Y_pred_phys, Y_batch_phys)
+print(f"Physical MSE: {phys_loss.item():.6f}")
+print(f"Physical RMSE: {torch.sqrt(phys_loss).item():.6f}")
+
+# Show the ratio
+print(f"\nRatio (phys/norm): {phys_loss.item() / norm_loss.item():.3f}")
+print(f"Y_std mean: {Y_std.mean():.6f}")
+print(f"Expected ratio ≈ (Y_std)²: {(Y_std.mean()**2):.6f}")
+
 # Evaluate inference time
 if TIME_EVAL:
     timing_stats = time_inference_comparison(model, test_ds, n_samples=100)
@@ -924,15 +987,15 @@ test_mse = eval_epoch(test_dl)
 
 if COUNT_COL:
     # Calculate % of test set where there are collisions
-    test_coll = count_collisions_continuous(model, test_dl, radius=radius, buffer = 0)
-    #test_coll = count_collisions(model, test_dl,radius)
+    test_coll = count_collisions_continuous(model, test_dl, radius=0.05, buffer = 0.005)
+    #test_coll = count_collisions(model, test_dl, radius)
 
     print(f"Test MSE: {test_mse:.6f}")
     print(f"Test collision rate: {test_coll * 100:.2f}%")
 
 if PLOT_TEST:
     # Plot multiple test samples
-    plot_many_samples(model, test_ds, radius, indices=[0], title_prefix="test")
+    plot_many_samples(model, test_ds, indices=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], title_prefix="test")
 
 # Plot user input instead of test set
 if SELF_EVAL:
@@ -965,23 +1028,4 @@ if SELF_EVAL:
     ground_truth = Y_denorm[np.newaxis, :]  # (1, T_out, 3)
 
     # Plot with ground truth
-    plot_sample_interactive_from_input(model, test_input, radius)
-
-if SWEEP_EVAL:
-    zsweep = np.arange(0.68, 0.72, 0.001)
-
-    base = np.array([[
-        [0.0, 0.0, 0.0],  # start
-        [1.0, 1.0, 1.0],  # end
-        [0.7, 0.7, 0.7],  # obstacle (oz will be overwritten)
-        [0.0, 0.0, 0.0]  # control: ZERO VELOCITY
-    ]], dtype=np.float32)
-
-    for oz in zsweep:
-        ti = base.copy()
-        ti[0, 2, 2] = float(oz)  # set obstacle z
-        fname = f"figs/interactive_sweep/oz_{oz:.3f}.png"
-        title = f"Center Obstacle Test – oz={oz:.3f}"
-        plot_sweep_interactive_from_input(model, ti, save_path=fname, title=title, show=False)
-
-        print(f"Obstacle position: {ti[0, 2, :]}")
+    plot_sample_interactive_from_input(model, test_input, ground_truth=ground_truth)

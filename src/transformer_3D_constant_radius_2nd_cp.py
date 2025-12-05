@@ -429,7 +429,7 @@ def plot_sample_interactive_from_input(model, test_input, radius):
     u, v = np.mgrid[0:2 * np.pi:20j, 0:np.pi:10j]
     for i, obs in enumerate(obstacles):
         ox, oy, oz = obs
-        xs = ox + radius * np.cos(u) * np.sin(v)
+        xs = ox + radiuså * np.cos(u) * np.sin(v)
         ys = oy + radius * np.sin(u) * np.sin(v)
         zs = oz + radius * np.cos(v)
 

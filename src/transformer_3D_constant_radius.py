@@ -24,12 +24,12 @@ from BeBOT import PiecewiseBernsteinPoly
 # ======================================================================================================================
 TRAIN = False        # train or load saved model
 MODEL_PATH = "models/best_model.pth"
-COUNT_COL = False
+COUNT_COL = True
 PLOT_TEST = False
 TIME_EVAL = False   # run timing benchmark
 SELF_EVAL = False   # user input (bottom of script)
 SWEEP_EVAL = False  # sweep values for gif
-NASA_EVAL = True
+NASA_EVAL = False
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -43,14 +43,13 @@ radius = 0.1
 obstacles = []
 start    = df[["x0","y0", "z0"]].to_numpy(np.float32)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)
-control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)
 for i in range(1, numObs + 1):
     obs_i = df[[f"ox{i}", f"oy{i}", f"oz{i}"]].to_numpy(np.float32)
     obstacles.append(obs_i)
 output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8","z2", "z3", "z4", "z5", "z6", "z7","z8"]
 
 # Input and Output sizes
-T_in = 3 + numObs
+T_in = 2 + numObs
 T_out = len(output_cols) // 3
 
 # Hyperparameters
@@ -226,8 +225,8 @@ class FlattenMLPHead(nn.Module):
         self.t_out   = t_out
         self.out_dim = out_dim
         self.net = nn.Sequential(
-            #nn.Linear(seq_len * d_model, hidden),
-            #nn.ReLU(),
+            nn.Linear(seq_len * d_model, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, t_out * out_dim)
         )
 
@@ -260,7 +259,6 @@ def plot_nasa_prediction(test_input_raw, pred_points, save_path=None, title=None
     x0, y0, z0 = test_input_raw[0,0]
     xf, yf, zf = test_input_raw[0,1]
     ox, oy, oz = test_input_raw[0,2]
-    vx, vy, vz = test_input_raw[0,3]
 
     # Build the control point arrays
     cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
@@ -452,10 +450,7 @@ def plot_sample_interactive_from_input(model, test_input, radius):
     # Extract points from test_input (already denormalized)
     x0, y0, z0 = test_input[0, 0]
     xf, yf, zf = test_input[0, 1]
-
     obstacles = test_input[0, 2:2+numObs]
-
-    cpx, cpy, cpz = test_input[0, 2 + numObs]
 
     # Build trajectory
     pred_points = output[0]  # (T_out, 3)
@@ -502,14 +497,6 @@ def plot_sample_interactive_from_input(model, test_input, radius):
         mode='markers',
         marker=dict(size=10, color=['green', 'orange'], symbol='diamond'),
         name='Start/End'
-    ))
-
-    # Heading control point
-    fig.add_trace(go.Scatter3d(
-        x=[cpx], y=[cpy], z=[cpz],
-        mode='markers',
-        marker=dict(size=8, color='purple'),
-        name='Initial Velocity'
     ))
 
     # Obstacle sphere
@@ -609,13 +596,6 @@ def plot_sweep_interactive_from_input(model, test_input, *,
         mode='markers',
         marker=dict(size=10, color=['green', 'orange'], symbol='diamond'),
         name='Start/End'
-    ))
-
-    fig.add_trace(go.Scatter3d(
-        x=[cpx], y=[cpy], z=[cpz],
-        mode='markers',
-        marker=dict(size=8, color='purple'),
-        name='Initial Velocity'
     ))
 
     # Obstacle sphere
@@ -839,7 +819,7 @@ def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=100):
 # ======================================================================================================================
 
 # Stack into tokens
-X_np = np.stack([start, end, *obstacles, control], axis=1)
+X_np = np.stack([start, end, *obstacles], axis=1)
 Y_np = df[output_cols].to_numpy(dtype=np.float32)
 
 # Split into each dimension
@@ -1019,7 +999,7 @@ if COUNT_COL:
 
 if PLOT_TEST:
     # Plot multiple test samples
-    plot_many_samples(model, test_ds, radius, indices=[0], title_prefix="test")
+    plot_many_samples(model, test_ds, radius, indices=[0,1,2,3,4,5,6,7,8,9,10], title_prefix="test")
 
 # Plot user input instead of test set
 if SELF_EVAL:
@@ -1063,7 +1043,6 @@ if NASA_EVAL:
 
     start_g = df_nasa[["x0", "y0", "z0"]].to_numpy(np.float32)
     end_g   = df_nasa[["xf", "yf", "zf"]].to_numpy(np.float32)
-    vel_g   = df_nasa[["vxinit", "vyinit", "vzinit"]].to_numpy(np.float32)
     obs_g   = df_nasa[["ox1", "oy1", "oz1"]].to_numpy(np.float32)
 
     num_rows = len(df_nasa)
@@ -1081,7 +1060,6 @@ if NASA_EVAL:
             start_g[i],
             end_g[i],
             obs_g[i],
-            vel_g[i]
         ]], dtype=np.float32)
 
         # Normalize using training stats
@@ -1100,7 +1078,6 @@ if NASA_EVAL:
             "x0": start_g[i, 0], "y0": start_g[i, 1], "z0": start_g[i, 2],
             "xf": end_g[i, 0],   "yf": end_g[i, 1],   "zf": end_g[i, 2],
             "ox": obs_g[i, 0],   "oy": obs_g[i, 1],   "oz": obs_g[i, 2],
-            "vx": vel_g[i, 0],   "vy": vel_g[i, 1],   "vz": vel_g[i, 2],
         }
 
         # Add predicted control points CP2 … CP8
@@ -1125,7 +1102,6 @@ if SWEEP_EVAL:
         [0.0, 0.0, 0.0],  # start
         [1.0, 1.0, 1.0],  # end
         [0.7, 0.7, 0.7],  # obstacle (oz will be overwritten)
-        [0.0, 0.0, 0.0]  # control: ZERO VELOCITY
     ]], dtype=np.float32)
 
     for oz in zsweep:

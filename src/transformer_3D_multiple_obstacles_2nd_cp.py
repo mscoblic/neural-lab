@@ -25,23 +25,34 @@ from BeBOT import PiecewiseBernsteinPoly
 # ======================================================================================================================
 # Global definitions
 # ======================================================================================================================
-TRAIN = True        # train or load saved model
+TRAIN = False        # train or load saved model
 MODEL_PATH = "models/best_model.pth"
 COUNT_COL = False
 PLOT_TEST = False
 TIME_EVAL = False   # run timing benchmark
-SELF_EVAL = True   # user input (bottom of script)
-SAVE_DATASETS = True
-DATASET_PATH = "data/mult_obs_cp.pkl"
+SELF_EVAL = False   # user input (bottom of script)
+LOAD_FROM_EXCEL = False
+ANALYZE_ATTENTION = True
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-file_path = "../data/CA3D/CA3D_15_obstacles_300k.xlsx"
-df = pd.read_excel(file_path)
-
-# Build 4 tokens
 numObs = 15
 radius = 0.05
+file_path = "../data/CA3D/CA3D_15_obstacles_300k.xlsx"
+df_pickle_path = "data/mult_obs_cp.pkl"
+
+if LOAD_FROM_EXCEL:
+    print("Loading from Excel (this will take a while)...")
+    df = pd.read_excel(file_path)
+    print("Saving dataframe to pickle for future use...")
+    df.to_pickle(df_pickle_path)
+    print(f"✓ Saved to {df_pickle_path}")
+else:
+    print("Loading from pickle (fast)...")
+    df = pd.read_pickle(df_pickle_path)
+    print(f"✓ Loaded {len(df)} rows")
+
+# Build 4 tokens
 obstacles = []
 start    = df[["x0","y0", "z0"]].to_numpy(np.float32)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)
@@ -56,12 +67,12 @@ T_in = 3 + numObs
 T_out = len(output_cols) // 3
 
 # Hyperparameters
-EPOCHS = 75
+EPOCHS = 10
 patience_counter = 0
-patience_limit = 30
+patience_limit = 300
 input_dim = 3
 d_model = 28
-num_heads = 2
+num_heads = 4
 num_layers = 1
 d_ff = 64
 dropout = 0.2
@@ -98,6 +109,9 @@ class MultiHeadAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
+        # Attention
+        self.return_attention = False
+
     # attn_scores: dot product between query and all keys (in a matrix)
     # attn_probs: relative importance probability between 0 and 1
     # output: new embedding for tokens after importance is applied
@@ -115,6 +129,8 @@ class MultiHeadAttention(nn.Module):
         # Multiply by values to obtain the final output
         output = torch.matmul(attn_probs, v)
 
+        if self.return_attention:
+            return output, attn_probs
         return output
 
     # Allow for parallel computation of multiple attention heads, split for each attention head
@@ -136,12 +152,14 @@ class MultiHeadAttention(nn.Module):
         K = self.split_heads(self.W_k(k))
         V = self.split_heads(self.W_v(v))
 
-        # Scaled dot product attention
-        attn_output = self.scaled_dot_product_attention(Q, K, V, mask)
-
-        # Combine heads and apply output transformation
-        output = self.W_o(self.combine_heads(attn_output))
-        return output
+        if self.return_attention:
+            attn_output, attn_weights = self.scaled_dot_product_attention(Q, K, V, mask)
+            output = self.W_o(self.combine_heads(attn_output))
+            return output, attn_weights
+        else:
+            attn_output = self.scaled_dot_product_attention(Q, K, V, mask)
+            output = self.W_o(self.combine_heads(attn_output))
+            return output
 
 class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff):
@@ -178,12 +196,21 @@ class EncoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, mask):
-        attn_output = self.self_attn(x, x, x, mask)
-        x = self.norm1(x + self.dropout(attn_output))   # Add and normalize
-        ff_output = self.feed_forward(x)
-        x = self.norm2(x + self.dropout(ff_output))     # Add and normalize
-        return x
+    def forward(self, x, mask, return_attention=False):
+        if return_attention:
+            self.self_attn.return_attention = True
+            attn_output, attn_weights = self.self_attn(x, x, x, mask)
+            self.self_attn.return_attention = False
+            x = self.norm1(x + self.dropout(attn_output))
+            ff_output = self.feed_forward(x)
+            x = self.norm2(x + self.dropout(ff_output))
+            return x, attn_weights
+        else:
+            attn_output = self.self_attn(x, x, x, mask)
+            x = self.norm1(x + self.dropout(attn_output))   # Add and normalize
+            ff_output = self.feed_forward(x)
+            x = self.norm2(x + self.dropout(ff_output))     # Add and normalize
+            return x
 
 class TransformerEncoder(nn.Module):
     def __init__(self, input_dim, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout, output_dim):
@@ -207,20 +234,28 @@ class TransformerEncoder(nn.Module):
         # Optional output projection
         self.head = nn.Linear(d_model, output_dim) if output_dim is not None else None
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
 
         # Project inputs into model dim + add positions
         h = self.input_proj(x)
         h = self.pos_enc(h)
 
+        attention_weights = []
+
         # Pass through encoder layers
         for layer in self.layers:
-            h = layer(h, mask=None)
+            if return_attention:
+                h, attn = layer(h, mask=None, return_attention=True)
+                attention_weights.append(attn)
+            else:
+                h = layer(h, mask=None)
 
         # Normalzie final representation
         h = self.norm(h)
 
         # Optionally project to outputs
+        if return_attention:
+            return (self.head(h) if self.head is not None else h), attention_weights
         return self.head(h) if self.head is not None else h
 
 class FlattenMLPHead(nn.Module):
@@ -666,7 +701,7 @@ def count_collisions(model, loader, radius):
     return collided / max(total, 1)
 
 @torch.no_grad()
-def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=200):
+def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=100):
     model.eval()
     device = next(model.parameters()).device
 
@@ -736,6 +771,64 @@ def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=200):
             total += 1
 
     return collided / max(total, 1)
+
+@torch.no_grad()
+def extract_attention_scores(model, dataset, indices, save_path="analysis/attention_scores.npz"):
+    """Extract and save attention weights for specific samples"""
+    model.eval()
+
+    all_attentions = []
+    all_inputs = []
+
+    for idx in indices:
+        X, Y = dataset[idx]
+        X_batch = X.unsqueeze(0).to(device)
+
+        # Enable attention return by calling encoder directly
+        _, attn_weights = model.encoder(X_batch, return_attention=True)
+
+        # attn_weights is a list (one per layer)
+        # Each is shape: (batch=1, num_heads, seq_len, seq_len)
+        all_attentions.append([a.cpu().numpy() for a in attn_weights])
+        all_inputs.append(X.cpu().numpy())
+
+    # Save
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    np.savez(save_path,
+             attentions=all_attentions,
+             inputs=all_inputs,
+             indices=indices)
+
+    print(f"Saved attention scores to {save_path}")
+    return all_attentions
+
+def plot_attention_heatmap(attn_weights, token_labels, save_path="analysis/attention_viz.png"):
+    """
+    Visualize attention patterns
+    attn_weights: (num_heads, seq_len, seq_len)
+    """
+    num_heads = attn_weights.shape[0]
+
+    fig, axes = plt.subplots(1, num_heads, figsize=(6 * num_heads, 5))
+    if num_heads == 1:
+        axes = [axes]
+
+    for head_idx in range(num_heads):
+        ax = axes[head_idx]
+        im = ax.imshow(attn_weights[head_idx], cmap='viridis', aspect='auto')
+        ax.set_title(f'Head {head_idx + 1}')
+        ax.set_xlabel('Key/Value Tokens')
+        ax.set_ylabel('Query Tokens')
+        ax.set_xticks(range(len(token_labels)))
+        ax.set_yticks(range(len(token_labels)))
+        ax.set_xticklabels(token_labels, rotation=45, ha='right')
+        ax.set_yticklabels(token_labels)
+        plt.colorbar(im, ax=ax)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160, bbox_inches='tight')
+    plt.close()
+    print(f"Saved attention heatmap to {save_path}")
 
 # ======================================================================================================================
 # Training Setup
@@ -990,15 +1083,15 @@ test_mse = eval_epoch(test_dl)
 
 if COUNT_COL:
     # Calculate % of test set where there are collisions
-    #test_coll = count_collisions_continuous(model, test_dl, radius=0.05, buffer = 0.01)
-    test_coll = count_collisions(model, test_dl, radius)
+    test_coll = count_collisions_continuous(model, test_dl, radius=0.05, buffer = 0.005)
+    #test_coll = count_collisions(model, test_dl, radius)
 
     print(f"Test MSE: {test_mse:.6f}")
     print(f"Test collision rate: {test_coll * 100:.2f}%")
 
 if PLOT_TEST:
     # Plot multiple test samples
-    plot_many_samples(model, test_ds, indices=[0], title_prefix="test")
+    plot_many_samples(model, test_ds, indices=[0, 100, 203, 532], title_prefix="test")
 
 # Plot user input instead of test set
 if SELF_EVAL:
@@ -1032,3 +1125,19 @@ if SELF_EVAL:
 
     # Plot with ground truth
     plot_sample_interactive_from_input(model, test_input, ground_truth=ground_truth)
+
+if ANALYZE_ATTENTION and not TRAIN:
+    print("\n=== Attention Analysis ===")
+
+    # Define token names
+    token_labels = ['Start', 'End'] + [f'Obs{i + 1}' for i in range(numObs)] + ['CP2']
+
+    # Choose samples to analyze
+    sample_indices = [0, 10, 100, 500, 1000]
+
+    # Extract attention scores
+    attentions = extract_attention_scores(model, test_ds, sample_indices)
+
+    # Visualize first sample
+    attn = attentions[0][0][0]  # First sample, first layer, remove batch dim
+    plot_attention_heatmap(attn, token_labels)

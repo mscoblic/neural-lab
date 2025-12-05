@@ -24,22 +24,34 @@ from BeBOT import PiecewiseBernsteinPoly
 # ======================================================================================================================
 # Global definitions
 # ======================================================================================================================
-TRAIN = False        # train or load saved model
+TRAIN = True        # train or load saved model
 MODEL_PATH = "models/best_model.pth"
 COUNT_COL = False
-PLOT_TEST = True
+PLOT_TEST = False
 TIME_EVAL = False   # run timing benchmark
-SELF_EVAL = True   # user input (bottom of script)
+SELF_EVAL = False   # user input (bottom of script)
+LOAD_FROM_EXCEL = True
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-file_path = "../data/CA3D/CA3D_15_obstacles_300k.xlsx"
-df = pd.read_excel(file_path)
+numObs = 3
+radius = 0.05
+file_path = "../data/BAM/3Obs_ML_Project.xlsx"
+df_pickle_path = "data/mult_obs_cp.pkl"
+
+if LOAD_FROM_EXCEL:
+    print("Loading from Excel (this will take a while)...")
+    df = pd.read_excel(file_path)
+    print("Saving dataframe to pickle for future use...")
+    df.to_pickle(df_pickle_path)
+    print(f"✓ Saved to {df_pickle_path}")
+else:
+    print("Loading from pickle (fast)...")
+    df = pd.read_pickle(df_pickle_path)
+    print(f"✓ Loaded {len(df)} rows")
 
 # Build 4 tokens
-numObs = 15
-radius = 0.05
 obstacles = []
 start    = df[["x0","y0", "z0"]].to_numpy(np.float32)
 end      = df[["xf","yf", "zf"]].to_numpy(np.float32)
@@ -47,27 +59,44 @@ control  = df[["vxinit","vyinit", "vzinit"]].to_numpy(np.float32)
 for i in range(1, numObs + 1):
     obs_i = df[[f"ox{i}", f"oy{i}", f"oz{i}"]].to_numpy(np.float32)
     obstacles.append(obs_i)
-output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8", "z2","z3", "z4", "z5", "z6", "z7","z8"]
+#output_cols = ["x2", "x3", "x4", "x5", "x6", "x7", "x8","y2", "y3", "y4", "y5", "y6", "y7", "y8", "z2","z3", "z4", "z5", "z6", "z7","z8"]
+
+output_cols = [
+    # X coordinates (x2-x46, all consecutive)
+    "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
+    "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30", "x31", "x32",
+    "x33", "x34", "x35", "x36", "x37", "x38", "x39", "x40", "x41", "x42", "x43", "x44", "x45", "x46",
+
+    # Y coordinates (y2-y46, all consecutive)
+    "y2", "y3", "y4", "y5", "y6", "y7", "y8", "y9", "y10", "y11", "y12", "y13", "y14", "y15", "y16",
+    "y17", "y18", "y19", "y20", "y21", "y22", "y23", "y24", "y25", "y26", "y27", "y28", "y29", "y30", "y31", "y32",
+    "y33", "y34", "y35", "y36", "y37", "y38", "y39", "y40", "y41", "y42", "y43", "y44", "y45", "y46",
+
+    # Z coordinates (z2-z46, all consecutive)
+    "z2", "z3", "z4", "z5", "z6", "z7", "z8", "z9", "z10", "z11", "z12", "z13", "z14", "z15", "z16",
+    "z17", "z18", "z19", "z20", "z21", "z22", "z23", "z24", "z25", "z26", "z27", "z28", "z29", "z30", "z31", "z32",
+    "z33", "z34", "z35", "z36", "z37", "z38", "z39", "z40", "z41", "z42", "z43", "z44", "z45", "z46"
+]
 
 # Input and Output sizes
 T_in = 3 + numObs
 T_out = len(output_cols) // 3
 
 # Hyperparameters
-EPOCHS = 300
+EPOCHS = 1000
 patience_counter = 0
-patience_limit = 75
+patience_limit = 500
 input_dim = 3
-d_model = 28
+d_model = 12
 num_heads = 2
 num_layers = 1
-d_ff = 64
-dropout = 0.2
+d_ff = 24
+dropout = 0.5
 output_dim = 3
 max_seq_length = T_in
 batch_size = 64
 lr = 1e-3
-weight_decay = 0.05
+weight_decay = 0.1
 warmup_epochs = 10
 min_lr = 1e-6
 
@@ -95,6 +124,7 @@ class MultiHeadAttention(nn.Module):
         self.W_k = nn.Linear(d_model, d_model)
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
+        self.last_attn_probs = None
 
     # attn_scores: dot product between query and all keys (in a matrix)
     # attn_probs: relative importance probability between 0 and 1
@@ -109,6 +139,8 @@ class MultiHeadAttention(nn.Module):
 
         # Softmax
         attn_probs = torch.softmax(attn_scores, dim=-1)
+
+        self.last_attn_probs = attn_probs.detach()
 
         # Multiply by values to obtain the final output
         output = torch.matmul(attn_probs, v)
@@ -222,7 +254,7 @@ class TransformerEncoder(nn.Module):
         return self.head(h) if self.head is not None else h
 
 class FlattenMLPHead(nn.Module):
-    def __init__(self, seq_len, d_model, hidden=128, t_out=7, out_dim=3, dropout=0.3):
+    def __init__(self, seq_len, d_model, hidden=48, t_out=7, out_dim=3, dropout=0.3):
         super().__init__()
         self.seq_len = seq_len
         self.d_model = d_model
@@ -407,13 +439,13 @@ def plot_sample_interactive_from_input(model, test_input, ground_truth=None):
 
     # Build predicted trajectory
     pred_points = output[0]  # (T_out, 3)
-    cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+    cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
 
-    control_points_x = np.array([x0, cp2x, cp3[0], cp4[0], cp5[0],
+    control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
                                  cp5[0], cp6[0], cp7[0], cp8[0], xf])
-    control_points_y = np.array([y0, cp2y, cp3[1], cp4[1], cp5[1],
+    control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
                                  cp5[1], cp6[1], cp7[1], cp8[1], yf])
-    control_points_z = np.array([z0, cp2z, cp3[2], cp4[2], cp5[2],
+    control_points_z = np.array([z0, cp2[2],cp3[2], cp4[2], cp5[2],
                                  cp5[2], cp6[2], cp7[2], cp8[2], zf])
 
     tknots = np.array([0, 0.5, 1.0])
@@ -447,13 +479,13 @@ def plot_sample_interactive_from_input(model, test_input, ground_truth=None):
     # Ground truth trajectory (if provided)
     if ground_truth is not None:
         gt_points = ground_truth[0]  # (T_out, 3)
-        gt_cp3, gt_cp4, gt_cp5, gt_cp6, gt_cp7, gt_cp8 = gt_points
+        gt_cp2, gt_cp3, gt_cp4, gt_cp5, gt_cp6, gt_cp7, gt_cp8 = gt_points
 
-        gt_control_points_x = np.array([x0, cp2x, gt_cp3[0], gt_cp4[0], gt_cp5[0],
+        gt_control_points_x = np.array([x0, gt_cp2[0],gt_cp3[0], gt_cp4[0], gt_cp5[0],
                                         gt_cp5[0], gt_cp6[0], gt_cp7[0], gt_cp8[0], xf])
-        gt_control_points_y = np.array([y0, cp2y, gt_cp3[1], gt_cp4[1], gt_cp5[1],
-                                        gt_cp5[1], gt_cp6[1], gt_cp7[1], gt_cp8[1], yf])
-        gt_control_points_z = np.array([z0, cp2z, gt_cp3[2], gt_cp4[2], gt_cp5[2],
+        gt_control_points_y = np.array([y0, gt_cp2[1], gt_cp3[1], gt_cp4[1], gt_cp5[1],
+                                        gt_cp5[1],gt_cp6[1], gt_cp7[1], gt_cp8[1], yf])
+        gt_control_points_z = np.array([z0, gt_cp2[2],gt_cp3[2], gt_cp4[2], gt_cp5[2],
                                         gt_cp5[2], gt_cp6[2], gt_cp7[2], gt_cp8[2], zf])
 
         gt_traj_x = PiecewiseBernsteinPoly(gt_control_points_x, tknots, t_eval)[0, :]
@@ -664,7 +696,7 @@ def count_collisions(model, loader, radius):
     return collided / max(total, 1)
 
 @torch.no_grad()
-def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=200):
+def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=100):
     model.eval()
     device = next(model.parameters()).device
 
@@ -696,18 +728,17 @@ def count_collisions_continuous(model, loader, radius, buffer=0.0, n_eval=200):
             # Get all obstacles
             obstacles = X_den[i, 2:2 + numObs].cpu().numpy()  # (numObs, 3)
 
-            # Get predicted control points
+            # Get predicted control points 2 - 46
             pred_points = Yp_den[i].cpu().numpy()  # (T_out, 3)
-            cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
+            cp2, cp3, cp4, cp5, cp6, cp7, cp8 = pred_points
 
-            cp2x, cp2y, cp2z = X_den[i, -1].cpu().numpy()
 
             # Build control point arrays with cp5 duplicated
-            control_points_x = np.array([x0, cp2x, cp3[0], cp4[0], cp5[0],
+            control_points_x = np.array([x0, cp2[0], cp3[0], cp4[0], cp5[0],
                                          cp5[0], cp6[0], cp7[0], cp8[0], xf])
-            control_points_y = np.array([y0, cp2y, cp3[1], cp4[1], cp5[1],
+            control_points_y = np.array([y0, cp2[1], cp3[1], cp4[1], cp5[1],
                                          cp5[1], cp6[1], cp7[1], cp8[1], yf])
-            control_points_z = np.array([z0, cp2z, cp3[2], cp4[2], cp5[2],
+            control_points_z = np.array([z0, cp2[2], cp3[2], cp4[2], cp5[2],
                                          cp5[2], cp6[2], cp7[2], cp8[2], zf])
 
             # Evaluate continuous trajectory
@@ -801,7 +832,7 @@ encoder = TransformerEncoder(
 ).to(device)
 
 # Build FNN
-head = FlattenMLPHead(seq_len=T_in, d_model=d_model, hidden=224, t_out=T_out, out_dim=output_dim).to(device)
+head = FlattenMLPHead(seq_len=T_in, d_model=d_model, hidden=48, t_out=T_out, out_dim=output_dim).to(device)
 
 # Wraps both together
 model = TrajModel(encoder, head).to(device)
@@ -988,8 +1019,8 @@ test_mse = eval_epoch(test_dl)
 
 if COUNT_COL:
     # Calculate % of test set where there are collisions
-    #test_coll = count_collisions_continuous(model, test_dl, radius=0.05, buffer = 0.01)
-    test_coll = count_collisions(model, test_dl, radius)
+    test_coll = count_collisions_continuous(model, test_dl, radius=0.05, buffer = 0.005)
+    #test_coll = count_collisions(model, test_dl, radius)
 
     print(f"Test MSE: {test_mse:.6f}")
     print(f"Test collision rate: {test_coll * 100:.2f}%")
